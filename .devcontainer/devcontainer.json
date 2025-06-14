@@ -1,0 +1,46 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+    "name": "IPPR Assignment", // A more descriptive name for your container
+
+    // Use a Dockerfile to build your image. This gives you more control.
+    "build": {
+        "dockerfile": "Dockerfile",     // This tells VS Code to use the Dockerfile in the same .devcontainer folder
+        "context": ".."
+    },
+
+    // (Optional) Features to add to the dev container. More info: https://containers.dev/features.
+    // "features": {}, // You can uncomment and add features later if needed.
+
+    // Use 'forwardPorts' to make a list of ports inside the container available locally.
+    // Streamlit typically runs on port 8501.
+    "forwardPorts": [8501],
+
+    // 'postCreateCommand' is run *after* the container is created and your workspace is mounted.
+    // Since we're installing requirements in the Dockerfile now, this might not be strictly necessary
+    // if you always rely on the Dockerfile. However, it can act as a fallback or for quick installs
+    // that don't need a rebuild. I'll leave it in for robustness, but it might be redundant
+    // if `RUN pip install` is in Dockerfile.
+    // Remove if you find it installs twice or prefer it only in Dockerfile.
+    "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
+
+    // Configure tool-specific properties for VS Code.
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python", // Python extension for language support
+                "ms-python.pylance", // Pylance for better IntelliSense and linting
+                "ms-azuretools.vscode-docker" // Docker extension for managing containers from VS Code
+            ],
+            "settings": {
+                // Optional: Add any VS Code settings you want applied in the container
+                "python.defaultInterpreterPath": "/usr/local/bin/python", // Ensure VS Code uses Python from the container
+                "python.analysis.extraPaths": ["/usr/local/lib/python3.12/site-packages"] // Adjust Python version as needed
+            }
+        }
+    },
+
+    // Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+    // For simplicity, especially with installing system packages, running as root is common in dev containers.
+    "remoteUser": "root"
+}
