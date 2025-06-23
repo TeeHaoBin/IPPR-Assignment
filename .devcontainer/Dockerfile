@@ -12,8 +12,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 # libtesseract-dev: Development files for Tesseract, needed if any library tries to compile against it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
-    tesseract-ocr \
-    libtesseract-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
