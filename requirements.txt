@@ -1,7 +1,10 @@
-streamlit==1.36.0
-opencv-python==4.9.0.80
-numpy==1.26.4
-scikit-learn==1.5.0
-Pillow==10.3.0
-paddlepaddle==2.6.2
-paddleocr==3.0.2
+setuptools>=68.0.0
+wheel>=0.41.0
+streamlit>=1.28.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+paddlepaddle==2.6.0
+paddleocr==2.9.0
+matplotlib>=3.7.0
+pandas>=2.0.0

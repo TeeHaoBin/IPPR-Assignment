@@ -1,100 +1,274 @@
 import streamlit as st
-import pytesseract
 import cv2
 import numpy as np
 from PIL import Image
+import re
 
-# Replace with your real LPR + classification logic
-def extract_plate_text(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    plate_text = pytesseract.image_to_string(gray)
-    return plate_text.strip()
+# Global variable to track OCR engine type
+OCR_ENGINE = None
+
+@st.cache_resource
+def load_ocr_model():
+    """Load OCR model with fallback options"""
+    global OCR_ENGINE
+    
+    # Try PaddleOCR first
+    try:
+        from paddleocr import PaddleOCR
+        import paddleocr
+        
+        # Check PaddleOCR version and initialize accordingly
+        try:
+            ocr_model = PaddleOCR(use_angle_cls=True, lang='en')
+        except:
+            # Fallback for older versions
+            ocr_model = PaddleOCR(lang='en')
+            
+        OCR_ENGINE = "paddleocr"
+        return ocr_model, "paddleocr"
+    except Exception as e:
+        st.warning(f"⚠️ PaddleOCR failed to load: {str(e)}")
+        return None, None
+
+def extract_plate_text_paddleocr(image, ocr_model):
+    """Extract text using PaddleOCR"""
+    try:
+        if len(image.shape) == 3:
+            if image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+            elif image.shape[2] == 3:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        
+        # Try with cls parameter first, fallback without it
+        try:
+            result = ocr_model.ocr(image, cls=True)
+        except TypeError:
+            # Older version doesn't support cls parameter
+            result = ocr_model.ocr(image)
+        
+        plate_text = ''
+        if result and result[0]:
+            texts = [line[1][0] for line in result[0]]
+            plate_text = ' '.join(texts)
+            plate_text = re.sub(r'[^\w\s]', '', plate_text).strip().upper()
+        
+        return plate_text
+    except Exception as e:
+        st.error(f"PaddleOCR Error: {str(e)}")
+        return ""
+
+def extract_plate_text(image, ocr_model, ocr_engine):
+    """Extract text from license plate using available OCR engine"""
+    if ocr_engine == "paddleocr" and ocr_model:
+        return extract_plate_text_paddleocr(image, ocr_model)
+    else:
+        st.error("❌ No OCR engine available!")
+        return ""
 
 def identify_state(plate_text):
-    state_prefix = plate_text[:1].upper()
+    """Identify Malaysian state from license plate text"""
+    if not plate_text:
+        return "Unknown"
+    
+    clean_plate = plate_text.replace(' ', '').upper()
+    
     state_map = {
+        # Single letter states
         "A": "Perak",
-        "B": "Selangor",
+        "B": "Selangor", 
         "C": "Pahang",
         "D": "Kelantan",
-        "EV": "Special Series",
         "F": "W.P. Putrajaya",
-        "FFF": "Special Series",
-        "GOLD": "Special Series",
-        "H": "Taxi",
         "J": "Johor",
         "K": "Kedah",
-        "KV": "Langkawi",
         "L": "W.P. Labuan",
-        "LIMO": "Special Series",
         "M": "Melaka",
-        "MADANI": "Special Series",
         "N": "Negeri Sembilan",
         "P": "Pulau Pinang",
-        "PETRA": "Special Series",
         "Q": "Sarawak",
         "R": "Perlis",
         "S": "Sabah",
         "T": "Terengganu",
-        "U": "Special Series",
         "V": "W.P. Kuala Lumpur",
-        "VIP": "Special Series",
         "W": "W.P. Kuala Lumpur",
+        "Z": "Military",
+        
+        # Multi-letter prefixes
+        "KV": "Langkawi",
+        "EV": "Special Series",
+        "FFF": "Special Series", 
+        "VIP": "Special Series",
+        "GOLD": "Special Series",
+        "LIMO": "Special Series",
+        "MADANI": "Special Series",
+        "PETRA": "Special Series",
+        "U": "Special Series",
         "X": "Special Series",
         "Y": "Special Series",
-        "Z": "Military"
+        "H": "Taxi"
     }
-    return state_map.get(state_prefix, "Unknown")
+    
+    for prefix in sorted(state_map.keys(), key=len, reverse=True):
+        if clean_plate.startswith(prefix):
+            return state_map[prefix]
+    
+    first_char = clean_plate[0] if clean_plate else ""
+    return state_map.get(first_char, "Unknown")
 
 def classify_vehicle(image):
-    # Placeholder logic
+    """Classify vehicle type (placeholder)"""
     return "Car"
 
-st.set_page_config(page_title="LPR & State ID System", layout="centered")
+# Streamlit App Configuration
+st.set_page_config(
+    page_title="Malaysian LPR System", 
+    page_icon="🚗",
+    layout="centered"
+)
 
-st.title("📸 License Plate Recognition (LPR) + State ID System")
+st.title("🚗 Malaysian License Plate Recognition System")
+st.markdown("Upload images of Malaysian license plates to extract text and identify the state of registration.")
 
+# Initialize OCR - this will be cached
+ocr_model, ocr_engine = load_ocr_model()
+
+# Update global variable
+OCR_ENGINE = ocr_engine
+
+# Check if OCR is available
+if ocr_model is None:
+    st.error("❌ Failed to initialize OCR engine. Please check the installation.")
+    st.stop()
+else:
+    st.success("✅ Using PaddleOCR engine")
+
+# Initialize session state
 if "images" not in st.session_state:
     st.session_state.images = []
 if "results" not in st.session_state:
     st.session_state.results = []
 
-# Upload Images
-uploaded = st.file_uploader("Upload one or more images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+# Sidebar with information
+with st.sidebar:
+    st.header("ℹ️ Information")
+    st.markdown(f"""
+    **Current OCR Engine:** {OCR_ENGINE.upper() if OCR_ENGINE else 'None'}
+    
+    **Supported States:**
+    - All Malaysian states
+    - Federal territories
+    - Special series plates
+    - Military plates
+    - Taxi plates
+    
+    **Tips for better results:**
+    - Use clear, well-lit images
+    - Ensure license plate is visible
+    - Avoid blurry or angled shots
+    """)
 
-if uploaded:
-    st.session_state.images = uploaded
+# File Upload Section
+st.header("📁 Upload Images")
+uploaded_files = st.file_uploader(
+    "Choose license plate images", 
+    type=["png", "jpg", "jpeg"], 
+    accept_multiple_files=True,
+    help="Upload one or more images containing Malaysian license plates"
+)
 
-# Process Button
-if st.button("Start") and st.session_state.images:
-    st.session_state.results.clear()
-    for file in st.session_state.images:
-        img = Image.open(file)
-        img_np = np.array(img)
-        plate_text = extract_plate_text(img_np)
-        state = identify_state(plate_text)
-        vehicle = classify_vehicle(img_np)
+if uploaded_files:
+    st.session_state.images = uploaded_files
+    st.success(f"✅ {len(uploaded_files)} image(s) uploaded successfully!")
 
-        st.session_state.results.append({
-            "filename": file.name,
-            "plate": plate_text,
-            "state": state,
-            "vehicle": vehicle,
-            "image": img
-        })
+# Processing Section
+col1, col2 = st.columns(2)
 
-# Show Results
+with col1:
+    if st.button("🚀 Process Images", type="primary", disabled=not st.session_state.images):
+        if st.session_state.images:
+            st.session_state.results.clear()
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, uploaded_file in enumerate(st.session_state.images):
+                status_text.text(f"Processing {uploaded_file.name}...")
+                
+                try:
+                    img = Image.open(uploaded_file)
+                    img_np = np.array(img)
+                    
+                    plate_text = extract_plate_text(img_np, ocr_model, ocr_engine)
+                    state = identify_state(plate_text)
+                    vehicle_type = classify_vehicle(img_np)
+                    
+                    st.session_state.results.append({
+                        "filename": uploaded_file.name,
+                        "plate_text": plate_text,
+                        "state": state,
+                        "vehicle_type": vehicle_type,
+                        "image": img
+                    })
+                    
+                except Exception as e:
+                    st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+                
+                progress_bar.progress((i + 1) / len(st.session_state.images))
+            
+            status_text.text("✅ Processing completed!")
+            st.balloons()
+
+with col2:
+    if st.button("🗑️ Clear All", type="secondary"):
+        st.session_state.images = []
+        st.session_state.results = []
+        st.rerun()
+
+# Results Section
 if st.session_state.results:
-    for result in st.session_state.results:
-        st.image(result["image"], caption=result["filename"], width=300)
-        st.markdown(f"""
-        **Plate:** `{result['plate']}`  
-        **State:** `{result['state']}`  
-        **Vehicle Type:** `{result['vehicle']}`  
-        """)
+    st.header("📊 Results")
+    
+    for i, result in enumerate(st.session_state.results, 1):
+        with st.expander(f"🖼️ Result {i}: {result['filename']}", expanded=True):
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                st.image(result["image"], caption=result["filename"], use_container_width=True)
+            
+            with col2:
+                st.markdown("### Extracted Information")
+                
+                info_html = f"""
+                <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin: 10px 0;">
+                    <h4 style="margin: 0 0 10px 0; color: #1f77b4;">🔢 License Plate</h4>
+                    <p style="font-size: 18px; font-weight: bold; margin: 0; color: #333;">
+                        {result['plate_text'] if result['plate_text'] else 'Not detected'}
+                    </p>
+                </div>
+                
+                <div style="background-color: #e8f5e8; padding: 15px; border-radius: 10px; margin: 10px 0;">
+                    <h4 style="margin: 0 0 10px 0; color: #2e8b57;">📍 State/Region</h4>
+                    <p style="font-size: 16px; font-weight: bold; margin: 0; color: #333;">
+                        {result['state']}
+                    </p>
+                </div>
+                
+                <div style="background-color: #fff0e6; padding: 15px; border-radius: 10px; margin: 10px 0;">
+                    <h4 style="margin: 0 0 10px 0; color: #ff8c00;">🚗 Vehicle Type</h4>
+                    <p style="font-size: 16px; font-weight: bold; margin: 0; color: #333;">
+                        {result['vehicle_type']}
+                    </p>
+                </div>
+                """
+                st.markdown(info_html, unsafe_allow_html=True)
 
-# Clear Button
-if st.button("Clear"):
-    st.session_state.images = []
-    st.session_state.results = []
-    st.experimental_rerun()
+# Footer
+st.markdown("---")
+st.markdown(
+    f"<div style='text-align: center; color: #666;'>"
+    f"🚗 Malaysian License Plate Recognition System | "
+    f"OCR Engine: {OCR_ENGINE.upper() if OCR_ENGINE else 'None'} | "
+    f"Built with Streamlit"
+    f"</div>", 
+    unsafe_allow_html=True
+)
