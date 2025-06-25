@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from PIL import Image
 import re
+from paddleocr import TextDetection
 
 # Global variable to track OCR engine type
 OCR_ENGINE = None
@@ -18,49 +19,96 @@ def load_ocr_model():
         import paddleocr
         
         # Check PaddleOCR version and initialize accordingly
-        try:
-            ocr_model = PaddleOCR(use_angle_cls=True, lang='en')
-        except:
-            # Fallback for older versions
-            ocr_model = PaddleOCR(lang='en')
-            
+        ocr_model = PaddleOCR(
+            use_doc_orientation_classify=False, 
+            use_doc_unwarping=False, 
+            use_textline_orientation=False
+        )
+        
         OCR_ENGINE = "paddleocr"
         return ocr_model, "paddleocr"
     except Exception as e:
         st.warning(f"⚠️ PaddleOCR failed to load: {str(e)}")
         return None, None
 
-def extract_plate_text_paddleocr(image, ocr_model):
-    """Extract text using PaddleOCR"""
+def extract_license_plate_text_correct(ocr_model, image):
+    """
+    Correct OCR function for dictionary-format results
+    """
     try:
-        if len(image.shape) == 3:
-            if image.shape[2] == 4:
-                image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
-            elif image.shape[2] == 3:
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        
-        # Try with cls parameter first, fallback without it
+        # Get OCR results
         try:
-            result = ocr_model.ocr(image, cls=True)
+            results = ocr_model.ocr(image, cls=True)
         except TypeError:
-            # Older version doesn't support cls parameter
-            result = ocr_model.ocr(image)
+            results = ocr_model.ocr(image)
         
-        plate_text = ''
-        if result and result[0]:
-            texts = [line[1][0] for line in result[0]]
-            plate_text = ' '.join(texts)
-            plate_text = re.sub(r'[^\w\s]', '', plate_text).strip().upper()
+        print(f"OCR Results type: {type(results)}")
         
-        return plate_text
+        # Handle different result formats
+        if isinstance(results, dict):
+            # Dictionary format - extract from 'res' key if it exists
+            if 'res' in results:
+                ocr_data = results['res']
+            else:
+                ocr_data = results
+                
+        elif isinstance(results, list) and len(results) > 0:
+            # List format - might contain dictionary
+            if isinstance(results[0], dict):
+                if 'res' in results[0]:
+                    ocr_data = results[0]['res']
+                else:
+                    ocr_data = results[0]
+        else:
+            print("Unexpected results format")
+            return None
+        
+        # Extract text and scores from dictionary format
+        if 'rec_texts' in ocr_data and 'rec_scores' in ocr_data:
+            texts = ocr_data['rec_texts']
+            scores = ocr_data['rec_scores']
+            
+            print(f"Found texts: {texts}")
+            print(f"Found scores: {scores}")
+            
+            if not texts or len(texts) == 0:
+                print("No text detected")
+                return None
+            
+            # Find best text based on confidence and length
+            best_text = None
+            highest_score = 0
+            
+            for i, (text, score) in enumerate(zip(texts, scores)):
+                print(f"Text {i}: '{text}' (confidence: {score:.3f})")
+                
+                # Basic filtering for license plates
+                clean_text = text.strip()
+                if len(clean_text) >= 3 and score > highest_score:
+                    best_text = clean_text
+                    highest_score = score
+            
+            if best_text:
+                # Clean the text (remove spaces for license plates)
+                final_text = best_text.replace(" ", "")
+                print(f"Selected text: '{final_text}' with confidence {highest_score:.3f}")
+                return final_text
+            else:
+                print("No suitable text found")
+                return None
+        else:
+            print("No 'rec_texts' or 'rec_scores' found in results")
+            print(f"Available keys: {list(ocr_data.keys())}")
+            return None
+            
     except Exception as e:
-        st.error(f"PaddleOCR Error: {str(e)}")
-        return ""
+        print(f"OCR Error: {str(e)}")
+        return None
 
 def extract_plate_text(image, ocr_model, ocr_engine):
     """Extract text from license plate using available OCR engine"""
     if ocr_engine == "paddleocr" and ocr_model:
-        return extract_plate_text_paddleocr(image, ocr_model)
+        return extract_license_plate_text_correct(ocr_model, image)
     else:
         st.error("❌ No OCR engine available!")
         return ""
