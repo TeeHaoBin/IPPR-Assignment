@@ -1,0 +1,1711 @@
+#!/usr/bin/env python3
+"""
+Malaysian License Plate Recognition System (IPPR)
+==================================================
+
+A complete license plate recognition system implementing the 9-phase academic pipeline:
+1. Image Acquisition
+2. Image Enhancement  
+3. Image Restoration
+4. Color Image Processing
+5. Wavelets and Multi-Resolution Processing
+6. Image Compression
+7. Morphological Processing
+8. Image Segmentation
+9. Representation & Description
+
+Author: Enhanced for 2-line license plate detection
+Version: 2.0 with smart filtering and OCR verification
+"""
+
+# ============================================================================
+# IMPORTS AND CONFIGURATION
+# ============================================================================
+
+import streamlit as st
+import cv2
+import numpy as np
+from PIL import Image
+import re
+import pywt
+import logging
+from typing import List, Tuple, Optional, Dict, Any
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global variable to track OCR engine type
+OCR_ENGINE = None
+
+# ============================================================================
+# OCR INITIALIZATION
+# ============================================================================
+
+@st.cache_resource
+def load_ocr_model():
+    """Load OCR model with fallback options"""
+    global OCR_ENGINE
+    
+    # Try PaddleOCR first
+    try:
+        from paddleocr import PaddleOCR
+        import paddleocr
+        
+        # Check PaddleOCR version and initialize accordingly
+        ocr_model = PaddleOCR(
+            use_doc_orientation_classify=False, 
+            use_doc_unwarping=False, 
+            use_textline_orientation=False,
+            show_log=False  # Reduce verbose output
+        )
+        
+        OCR_ENGINE = "paddleocr"
+        st.success("✅ PaddleOCR loaded successfully!")
+        return ocr_model, "paddleocr"
+    except Exception as e:
+        st.warning(f"⚠️ PaddleOCR failed to load: {str(e)}")
+        logger.error(f"PaddleOCR loading failed: {e}")
+        return None, None
+
+# ============================================================================
+# SMART FILTERING FUNCTIONS
+# ============================================================================
+
+def analyze_color_characteristics(roi_color):
+    """Analyze color characteristics specific to Malaysian license plates"""
+    if roi_color.size == 0 or len(roi_color.shape) != 3:
+        return False, 0.0
+    
+    try:
+        # Convert to HSV for better color analysis
+        hsv = cv2.cvtColor(roi_color, cv2.COLOR_RGB2HSV)
+        h, s, v = cv2.split(hsv)
+        
+        # Malaysian license plates typically have:
+        # - White/light backgrounds with dark text
+        # - Black backgrounds with white/yellow text (taxis)
+        # - Blue backgrounds with white text (government)
+        
+        # Check for dominant light background (most common)
+        light_pixels = np.sum(v > 180)  # Bright pixels
+        dark_pixels = np.sum(v < 75)    # Dark pixels
+        total_pixels = roi_color.shape[0] * roi_color.shape[1]
+        
+        light_ratio = light_pixels / total_pixels
+        dark_ratio = dark_pixels / total_pixels
+        
+        # Pattern 1: Light background with dark text (70%+ light background)
+        is_light_plate = light_ratio > 0.6 and dark_ratio > 0.05
+        
+        # Pattern 2: Dark background with light text (60%+ dark background)
+        is_dark_plate = dark_ratio > 0.5 and light_ratio > 0.05
+        
+        # Pattern 3: Moderate contrast (good mix of light and dark)
+        is_contrast_plate = 0.2 <= light_ratio <= 0.8 and 0.1 <= dark_ratio <= 0.6
+        
+        # Calculate color uniformity (plates have relatively uniform backgrounds)
+        bg_pixels = roi_color[v > np.median(v)]  # Background pixels
+        if len(bg_pixels) > 10:
+            bg_std = np.std(bg_pixels)
+            color_uniformity = 1.0 / (1.0 + bg_std / 50.0)  # Lower std = higher uniformity
+        else:
+            color_uniformity = 0.0
+        
+        is_plate_color = is_light_plate or is_dark_plate or is_contrast_plate
+        confidence = color_uniformity * (0.8 if is_light_plate else 0.6 if is_dark_plate else 0.4)
+        
+        return is_plate_color, confidence
+        
+    except Exception:
+        return False, 0.0
+
+def analyze_texture_characteristics(roi_gray):
+    """Analyze texture patterns typical of license plates"""
+    if roi_gray.size == 0:
+        return False, 0.0
+    
+    try:
+        # License plates have relatively uniform texture with text patterns
+        
+        # 1. Calculate gradient magnitude for texture analysis
+        grad_x = cv2.Sobel(roi_gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(roi_gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # 2. Check for regular text patterns
+        # License plates have regular character spacing
+        horizontal_profile = np.mean(gradient_magnitude, axis=0)
+        
+        # Find peaks in horizontal profile (character boundaries)
+        try:
+            from scipy.signal import find_peaks
+            peaks, _ = find_peaks(horizontal_profile, height=np.mean(horizontal_profile) * 0.5)
+        except ImportError:
+            # Fallback peak detection without scipy
+            threshold = np.mean(horizontal_profile) * 0.5
+            peaks = []
+            for i in range(1, len(horizontal_profile) - 1):
+                if (horizontal_profile[i] > threshold and 
+                    horizontal_profile[i] > horizontal_profile[i-1] and 
+                    horizontal_profile[i] > horizontal_profile[i+1]):
+                    peaks.append(i)
+            peaks = np.array(peaks)
+        
+        # Regular spacing indicates text characters
+        if len(peaks) >= 2:
+            spacings = np.diff(peaks)
+            spacing_regularity = 1.0 - (np.std(spacings) / np.mean(spacings)) if np.mean(spacings) > 0 else 0.0
+            spacing_regularity = max(0.0, min(1.0, spacing_regularity))
+        else:
+            spacing_regularity = 0.0
+        
+        # 3. Texture uniformity (backgrounds should be relatively uniform)
+        texture_variance = np.var(roi_gray)
+        texture_score = 1.0 / (1.0 + abs(texture_variance - 1500) / 1000.0)  # Optimal around 1500
+        
+        is_plate_texture = spacing_regularity > 0.3 or texture_score > 0.5
+        confidence = (spacing_regularity * 0.6 + texture_score * 0.4)
+        
+        return is_plate_texture, confidence
+        
+    except Exception:
+        return False, 0.0
+
+def match_plate_template(roi_gray):
+    """Template matching for Malaysian license plate characteristics"""
+    if roi_gray.size == 0:
+        return False, 0.0
+    
+    try:
+        # Create simple templates for character patterns
+        h, w = roi_gray.shape
+        
+        # Template 1: Single line text pattern
+        template_1line = np.ones((max(20, h//3), max(60, w//2)), dtype=np.uint8) * 255
+        template_1line[h//6:h//6+h//6, :] = 0  # Dark text stripe
+        
+        # Template 2: Two line text pattern  
+        template_2line = np.ones((max(30, h//2), max(40, w//3)), dtype=np.uint8) * 255
+        template_2line[h//8:h//8+h//8, :] = 0      # Top text line
+        template_2line[h//2:h//2+h//8, :] = 0      # Bottom text line
+        
+        # Resize templates to match ROI size
+        template_1line = cv2.resize(template_1line, (min(w, 100), min(h, 40)))
+        template_2line = cv2.resize(template_2line, (min(w, 80), min(h, 60)))
+        
+        # Resize ROI for template matching
+        roi_resized = cv2.resize(roi_gray, (template_1line.shape[1], template_1line.shape[0]))
+        
+        # Match templates
+        match_1line = cv2.matchTemplate(roi_resized, template_1line, cv2.TM_CCOEFF_NORMED)
+        match_2line = cv2.matchTemplate(roi_resized, template_2line, cv2.TM_CCOEFF_NORMED)
+        
+        confidence_1line = np.max(match_1line) if match_1line.size > 0 else 0.0
+        confidence_2line = np.max(match_2line) if match_2line.size > 0 else 0.0
+        
+        best_confidence = max(confidence_1line, confidence_2line)
+        is_template_match = best_confidence > 0.3
+        
+        return is_template_match, best_confidence
+        
+    except Exception:
+        return False, 0.0
+
+# ============================================================================
+# ENHANCED CANDIDATE DETECTION
+# ============================================================================
+
+def find_plate_candidates_from_binary(binary_image: np.ndarray, original_image: np.ndarray = None) -> List[Tuple[int, int, int, int, float]]:
+    """Enhanced helper function to find candidates from binary image with smart filtering"""
+    contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return []
+    
+    candidates = []
+    img_area = binary_image.shape[0] * binary_image.shape[1]
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        if h == 0 or w == 0:
+            continue
+            
+        # Improved filtering approach with percentage-based sizing
+        aspect_ratio = w / float(h)
+        area_ratio = (w * h) / img_area
+        
+        # 1. Aspect ratio check (support both single-line and 2-line)
+        valid_single_line = 2.0 <= aspect_ratio <= 5.0  # Standard plates
+        valid_two_line = 1.0 <= aspect_ratio <= 2.5      # 2-line plates like WSL/2956
+        valid_square_2line = 0.8 <= aspect_ratio <= 1.2  # Very square 2-line plates
+        valid_aspect = valid_single_line or valid_two_line or valid_square_2line
+        
+        # 2. Size check (percentage of image area - more adaptive)
+        valid_size = 0.0005 <= area_ratio <= 0.08  # 0.05% to 8% of image
+        
+        # 3. Minimum dimensions (absolute minimums)
+        valid_dimensions = w > 40 and h > 20
+        
+        # 4. Maximum dimensions (prevent huge false positives)
+        max_w = binary_image.shape[1] * 0.6  # Max 60% of image width
+        max_h = binary_image.shape[0] * 0.4  # Max 40% of image height
+        valid_max_dimensions = w <= max_w and h <= max_h
+        
+        if not (valid_aspect and valid_size and valid_dimensions and valid_max_dimensions):
+            continue
+            
+        # 5. Rectangularity and shape quality checks
+        extent = area / (w * h) if (w * h) > 0 else 0
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / hull_area if hull_area > 0 else 0
+        
+        # Check if contour is approximately rectangular
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter == 0:
+            continue
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        
+        # Approximate contour to check for rectangular shape
+        epsilon = 0.02 * perimeter
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        
+        # Filter for license plate shape characteristics
+        is_rectangular = len(approx) >= 4 and len(approx) <= 8  # Roughly rectangular
+        good_circularity = 0.1 <= circularity <= 0.9  # Not too circular, not too irregular
+        good_extent = extent > 0.3  # Relaxed from 0.4 for 2-line plates
+        good_solidity = solidity > 0.6  # Relaxed from 0.65 for 2-line plates
+        
+        if not (good_extent and good_solidity and is_rectangular and good_circularity):
+            continue
+            
+        # 6. SMART FILTERING: Progressive multi-stage validation
+        confidence_score = 0.0
+        
+        if original_image is not None:
+            # Extract regions for analysis
+            roi_gray = binary_image[y:y+h, x:x+w] if len(binary_image.shape) == 2 else cv2.cvtColor(binary_image[y:y+h, x:x+w], cv2.COLOR_RGB2GRAY)
+            roi_color = original_image[y:y+h, x:x+w] if len(original_image.shape) == 3 else cv2.cvtColor(original_image[y:y+h, x:x+w], cv2.COLOR_GRAY2RGB)
+            
+            # Stage 1: Color Analysis
+            is_color_match, color_confidence = analyze_color_characteristics(roi_color)
+            confidence_score += color_confidence * 0.3
+            
+            # Stage 2: Texture Analysis  
+            is_texture_match, texture_confidence = analyze_texture_characteristics(roi_gray)
+            confidence_score += texture_confidence * 0.3
+            
+            # Stage 3: Template Matching
+            is_template_match, template_confidence = match_plate_template(roi_gray)
+            confidence_score += template_confidence * 0.4
+            
+            # Progressive filtering: Only reject if ALL methods fail
+            total_matches = sum([is_color_match, is_texture_match, is_template_match])
+            
+            # Reject only if confidence is very low AND no method matches
+            if confidence_score < 0.1 and total_matches == 0:
+                continue  # Reject obvious non-plates
+            
+            # Boost area score based on confidence
+            area = area * (1.0 + confidence_score)  # Confidence boost
+        
+        candidates.append((x, y, w, h, area))
+    
+    return candidates
+
+# ============================================================================
+# LICENSE PLATE DETECTION METHODS
+# ============================================================================
+
+def detect_license_plate_regions(image: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
+    """
+    Detect license plate regions using multiple preprocessing approaches
+    
+    Args:
+        image: Input grayscale image (NOT binary)
+        
+    Returns:
+        List of tuples (x, y, w, h, area) for detected plate candidates
+    """
+    all_candidates = []
+    
+    # Method 1: Adaptive thresholding
+    try:
+        adaptive_thresh = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        candidates1 = find_plate_candidates_from_binary(adaptive_thresh, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "adaptive") for c in candidates1])
+    except:
+        pass
+    
+    # Method 2: Dark region detection (license plates are typically dark)
+    try:
+        # Invert image to find dark regions as white
+        inverted = cv2.bitwise_not(image)
+        _, dark_thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        candidates2 = find_plate_candidates_from_binary(dark_thresh, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "dark") for c in candidates2])
+    except:
+        pass
+    
+    # Method 2b: Standard Otsu thresholding
+    try:
+        _, otsu_thresh = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        candidates2b = find_plate_candidates_from_binary(otsu_thresh, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "otsu") for c in candidates2b])
+    except:
+        pass
+    
+    # Method 3: Enhanced edge detection for license plates
+    try:
+        # Use bilateral filter before edge detection to reduce noise but keep edges
+        bilateral = cv2.bilateralFilter(image, 11, 17, 17)
+        edges = cv2.Canny(bilateral, 30, 100)
+        
+        # Use wider horizontal kernel to connect license plate characters
+        kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 3))  # Wider to connect "AAT" and "40"
+        morph = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel_rect)
+        
+        # Additional horizontal dilation to connect characters
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 2))  # Wider horizontal connection
+        morph = cv2.dilate(morph, kernel_dilate, iterations=2)
+        
+        candidates3 = find_plate_candidates_from_binary(morph, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "edge") for c in candidates3])
+    except:
+        pass
+    
+    # Method 4: License plate specific detection (dark regions with high contrast)
+    try:
+        # Look for regions that are darker than average but have high local contrast
+        mean_intensity = np.mean(image)
+        
+        # Create mask for dark regions
+        dark_mask = image < (mean_intensity * 0.7)
+        dark_mask = dark_mask.astype(np.uint8) * 255
+        
+        # Apply morphological operations to connect license plate characters
+        # Use wider horizontal kernel to connect characters on the same plate
+        kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))  # Wider to connect characters
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel_connect)
+        
+        # Clean up noise with smaller kernel
+        kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, kernel_clean)
+        
+        candidates4 = find_plate_candidates_from_binary(dark_mask, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "contrast") for c in candidates4])
+    except:
+        pass
+    
+    # Method 5: Light text on dark background (bus plates)
+    try:
+        # Look for bright regions (light text) on darker backgrounds
+        mean_intensity = np.mean(image)
+        
+        # Create mask for bright regions (light text) - more aggressive threshold
+        bright_mask = image > (mean_intensity * 1.1)  # Lower threshold to catch more text
+        bright_mask = bright_mask.astype(np.uint8) * 255
+        
+        # Apply morphological operations to connect light text characters
+        kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 6))  # Even wider for bus plates
+        bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, kernel_connect)
+        
+        # Additional dilation to ensure text connection
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+        bright_mask = cv2.dilate(bright_mask, kernel_dilate, iterations=1)
+        
+        # Clean up with opening
+        kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 5))
+        bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, kernel_clean)
+        
+        candidates5 = find_plate_candidates_from_binary(bright_mask, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "bright") for c in candidates5])
+    except:
+        pass
+    
+    # Method 6: Bus-specific license plate detection
+    try:
+        height, width = image.shape[:2]
+        
+        # Focus on lower portion of image where bus plates typically are
+        lower_third = image[height//3:, :]  # Bottom 2/3 of image
+        
+        # Use very aggressive thresholding for bus plates
+        _, bus_thresh = cv2.threshold(lower_third, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Very wide morphological operations for bus text
+        kernel_wide = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 8))  # Extra wide for bus plates
+        bus_processed = cv2.morphologyEx(bus_thresh, cv2.MORPH_CLOSE, kernel_wide)
+        
+        # Additional connection with dilation
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 5))
+        bus_processed = cv2.dilate(bus_processed, kernel_dilate, iterations=2)
+        
+        # Clean up small noise
+        kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 6))
+        bus_processed = cv2.morphologyEx(bus_processed, cv2.MORPH_OPEN, kernel_clean)
+        
+        # Find candidates in the processed lower portion
+        bus_candidates = find_plate_candidates_from_binary(bus_processed, lower_third)
+        
+        # Adjust y-coordinates back to full image coordinates
+        adjusted_bus_candidates = []
+        for x, y, w, h, area in bus_candidates:
+            adjusted_y = y + height//3  # Add offset for lower third
+            adjusted_bus_candidates.append((x, adjusted_y, w, h, area, "bus"))
+        
+        all_candidates.extend(adjusted_bus_candidates)
+    except:
+        pass
+    
+    # Method 7: Two-line license plate detection (e.g., WSL\n2956)
+    try:
+        # Apply adaptive threshold optimized for 2-line plates
+        adaptive_2line = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 3)
+        
+        # Use vertical morphological operations to connect stacked text
+        kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 8))  # Tall kernel for vertical connection
+        morph_2line = cv2.morphologyEx(adaptive_2line, cv2.MORPH_CLOSE, kernel_vertical)
+        
+        # Also apply horizontal connection within each line
+        kernel_horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 3))  # Wide kernel for horizontal connection
+        morph_2line = cv2.morphologyEx(morph_2line, cv2.MORPH_CLOSE, kernel_horizontal)
+        
+        # Additional morphological operations to merge the two lines
+        kernel_merge = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 12))  # Medium width, taller for 2-line merging
+        morph_2line = cv2.morphologyEx(morph_2line, cv2.MORPH_CLOSE, kernel_merge)
+        
+        # Clean up noise while preserving main structures
+        kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
+        morph_2line = cv2.morphologyEx(morph_2line, cv2.MORPH_OPEN, kernel_clean)
+        
+        candidates_2line = find_plate_candidates_from_binary(morph_2line, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "2line") for c in candidates_2line])
+    except:
+        pass
+    
+    # Remove duplicates (similar positions)
+    unique_candidates = []
+    for candidate in all_candidates:
+        x, y, w, h, area, method = candidate
+        is_duplicate = False
+        for existing in unique_candidates:
+            ex, ey, ew, eh, ea, em = existing
+            # Check if centers are close (within 20 pixels)
+            if abs((x + w/2) - (ex + ew/2)) < 20 and abs((y + h/2) - (ey + eh/2)) < 20:
+                is_duplicate = True
+                # Keep the larger area
+                if area > ea:
+                    unique_candidates.remove(existing)
+                    unique_candidates.append(candidate)
+                break
+        if not is_duplicate:
+            unique_candidates.append(candidate)
+    
+    # Convert back to original format and sort
+    final_candidates = [(x, y, w, h, area) for x, y, w, h, area, method in unique_candidates]
+    final_candidates.sort(key=lambda x: x[4], reverse=True)
+    return final_candidates[:10]
+
+# ============================================================================
+# FORMAT VALIDATION AND OCR VERIFICATION
+# ============================================================================
+
+def validate_malaysian_plate_format(text: str) -> Tuple[bool, float, str]:
+    """Validate if text matches Malaysian license plate formats"""
+    if not text or len(text) < 3:
+        return False, 0.0, "too_short"
+    
+    clean_text = re.sub(r'[^A-Z0-9]', '', text.upper())
+    
+    # Malaysian plate patterns
+    patterns = [
+        # Standard format: ABC1234, A1234B, etc.
+        (r'^[A-Z]{1,3}[0-9]{1,4}[A-Z]?$', 0.9, "standard"),
+        # 2-line format: ABC\n1234 or AB\n1234
+        (r'^[A-Z]{1,3}[0-9]{1,4}$', 0.8, "two_line"),
+        # Special series: numbers only
+        (r'^[0-9]{1,6}$', 0.6, "numeric"),
+        # Government/special: mixed patterns
+        (r'^[A-Z0-9]{4,8}$', 0.7, "mixed"),
+    ]
+    
+    for pattern, confidence, format_type in patterns:
+        if re.match(pattern, clean_text):
+            # Additional validation for common Malaysian prefixes
+            state_codes = ['A', 'B', 'C', 'D', 'F', 'J', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Z']
+            
+            if format_type in ["standard", "two_line"] and clean_text[0] in state_codes:
+                confidence += 0.1  # Bonus for valid state code
+            
+            return True, confidence, format_type
+    
+    return False, 0.0, "invalid"
+
+def detect_text_lines(roi_gray):
+    """Detect horizontal text lines in the ROI for 2-line processing"""
+    if roi_gray.size == 0:
+        return []
+    
+    try:
+        # Create horizontal projection
+        horizontal_projection = np.sum(roi_gray < 128, axis=1)  # Sum dark pixels horizontally
+        
+        # Smooth the projection
+        try:
+            from scipy.ndimage import gaussian_filter1d
+            smoothed = gaussian_filter1d(horizontal_projection, sigma=1.0)
+        except ImportError:
+            # Simple smoothing fallback
+            kernel = np.array([0.25, 0.5, 0.25])
+            smoothed = np.convolve(horizontal_projection, kernel, mode='same')
+        
+        # Find peaks (text lines)
+        try:
+            from scipy.signal import find_peaks
+            peaks, properties = find_peaks(smoothed, height=np.max(smoothed) * 0.3, distance=len(smoothed)//4)
+        except ImportError:
+            # Fallback peak detection
+            threshold = np.max(smoothed) * 0.3
+            min_distance = len(smoothed) // 4
+            peaks = []
+            
+            for i in range(min_distance, len(smoothed) - min_distance):
+                if smoothed[i] > threshold:
+                    # Check if it's a local maximum
+                    is_peak = True
+                    for j in range(max(0, i - min_distance), min(len(smoothed), i + min_distance)):
+                        if smoothed[j] > smoothed[i]:
+                            is_peak = False
+                            break
+                    if is_peak:
+                        peaks.append(i)
+            peaks = np.array(peaks)
+        
+        # Extract line regions
+        lines = []
+        for peak in peaks:
+            # Find line boundaries
+            start = peak
+            end = peak
+            
+            # Expand backwards
+            while start > 0 and smoothed[start] > np.max(smoothed) * 0.1:
+                start -= 1
+            
+            # Expand forwards  
+            while end < len(smoothed) - 1 and smoothed[end] > np.max(smoothed) * 0.1:
+                end += 1
+            
+            if end - start > 5:  # Minimum line height
+                lines.append((start, end))
+        
+        return lines
+        
+    except Exception:
+        return []
+
+def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional[str]:
+    """
+    Enhanced OCR function for text extraction from license plates with 2-line support
+    
+    Args:
+        ocr_model: Loaded OCR model
+        image: Input image for text extraction
+        
+    Returns:
+        Extracted text or None if extraction failed
+    """
+    if ocr_model is None:
+        return None
+        
+    try:
+        # Ensure image is in correct format
+        if len(image.shape) == 3:
+            # Convert RGB to BGR for PaddleOCR
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        
+        # Get OCR results
+        try:
+            results = ocr_model.ocr(image, cls=True)
+        except TypeError:
+            results = ocr_model.ocr(image)
+        
+        # Handle PaddleOCR results format
+        if isinstance(results, list) and len(results) > 0:
+            # Standard PaddleOCR format: list of list of [bbox, (text, confidence)]
+            if results[0] is not None:
+                texts_and_scores = []
+                for detection in results[0]:
+                    if len(detection) >= 2:
+                        text, confidence = detection[1]
+                        texts_and_scores.append((text, confidence))
+                
+                if texts_and_scores:
+                    # Sort by confidence to get reliable texts first
+                    texts_and_scores.sort(key=lambda x: x[1], reverse=True)
+                    
+                    # Try to find single complete plate text first
+                    for text, score in texts_and_scores:
+                        clean_text = re.sub(r'[^A-Z0-9]', '', text.strip().upper())
+                        if len(clean_text) >= 5 and score > 0.7:  # High confidence complete plate
+                            return clean_text
+                    
+                    # ENHANCED 2-LINE PROCESSING: Better line detection and combination
+                    if len(texts_and_scores) >= 2:
+                        # First, try to detect text lines using image analysis
+                        if len(image.shape) == 3:
+                            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                        else:
+                            gray = image
+                        
+                        text_lines = detect_text_lines(gray)
+                        
+                        # Get text detections along with their bounding boxes
+                        bbox_texts = []
+                        for i, detection in enumerate(results[0][:len(texts_and_scores)]):
+                            if len(detection) >= 2:
+                                bbox = detection[0]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                                text, confidence = detection[1]
+                                clean_text = re.sub(r'[^A-Z0-9]', '', text.strip().upper())
+                                
+                                if len(clean_text) >= 1 and confidence > 0.3:  # Lower threshold for 2-line
+                                    # Calculate center coordinates
+                                    center_y = sum([point[1] for point in bbox]) / 4
+                                    center_x = sum([point[0] for point in bbox]) / 4
+                                    
+                                    # Calculate text area for weighting
+                                    width = max([point[0] for point in bbox]) - min([point[0] for point in bbox])
+                                    height = max([point[1] for point in bbox]) - min([point[1] for point in bbox])
+                                    area = width * height
+                                    
+                                    bbox_texts.append((clean_text, confidence, center_y, center_x, area))
+                        
+                        if len(bbox_texts) >= 2:
+                            # Sort by vertical position (top to bottom)
+                            bbox_texts.sort(key=lambda x: x[2])
+                            
+                            # Try different combination strategies
+                            best_combination = None
+                            best_confidence = 0
+                            
+                            # Strategy 1: Simple top-bottom combination
+                            for i in range(len(bbox_texts)-1):
+                                for j in range(i+1, min(len(bbox_texts), i+3)):  # Try next 2 candidates
+                                    text1, conf1, y1, x1, area1 = bbox_texts[i]
+                                    text2, conf2, y2, x2, area2 = bbox_texts[j]
+                                    
+                                    # Check if texts are vertically aligned (2-line format)
+                                    vertical_distance = abs(y2 - y1)
+                                    horizontal_overlap = min(abs(x1 - x2), gray.shape[1] * 0.3)
+                                    
+                                    if vertical_distance > 5 and horizontal_overlap < gray.shape[1] * 0.5:
+                                        # Determine order based on position and typical Malaysian formats
+                                        if y1 < y2:  # text1 is above text2
+                                            combined = text1 + text2
+                                        else:  # text2 is above text1
+                                            combined = text2 + text1
+                                        
+                                        # Validate combination
+                                        is_valid, format_conf, _ = validate_malaysian_plate_format(combined)
+                                        
+                                        if is_valid:
+                                            combo_confidence = (conf1 + conf2) / 2 * format_conf
+                                            if combo_confidence > best_confidence:
+                                                best_combination = combined
+                                                best_confidence = combo_confidence
+                            
+                            # Strategy 2: Fallback - simple concatenation of top 2
+                            if not best_combination and len(bbox_texts) >= 2:
+                                combined_text = bbox_texts[0][0] + bbox_texts[1][0]
+                                avg_confidence = (bbox_texts[0][1] + bbox_texts[1][1]) / 2
+                                
+                                if len(combined_text) >= 4 and avg_confidence > 0.4:
+                                    best_combination = combined_text
+                                    best_confidence = avg_confidence
+                            
+                            if best_combination and best_confidence > 0.4:
+                                return best_combination
+                    
+                    # Fallback: use best single detection
+                    best_text = None
+                    highest_score = 0
+                    
+                    for text, score in texts_and_scores:
+                        clean_text = re.sub(r'[^A-Z0-9]', '', text.strip().upper())
+                        if len(clean_text) >= 2 and score > highest_score:
+                            best_text = clean_text
+                            highest_score = score
+                    
+                    if best_text and len(best_text) >= 3:
+                        return best_text
+        
+        return None
+            
+    except Exception as e:
+        logger.error(f"OCR Error: {str(e)}")
+        st.error(f"OCR Error: {str(e)}")
+        return None
+
+def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, original_image: np.ndarray) -> List[Tuple]:
+    """Run OCR verification on top candidates and filter based on text quality"""
+    if not candidates or ocr_model is None:
+        return [(c[0], c[1], c[2], c[3], c[4], "", 0.0) for c in candidates]
+    
+    verified_candidates = []
+    
+    # Process top candidates (limit to save processing time)
+    for i, (x, y, w, h, area) in enumerate(candidates[:8]):
+        try:
+            # Extract and enhance the region
+            enhanced_roi = enhance_plate_region(original_image, x, y, w, h)
+            
+            # Run OCR
+            extracted_text = extract_plate_text(enhanced_roi, ocr_model, ocr_engine)
+            
+            # Validate format
+            is_valid, format_confidence, format_type = validate_malaysian_plate_format(extracted_text)
+            
+            # Calculate overall OCR confidence
+            ocr_confidence = 0.0
+            if extracted_text:
+                # Base confidence from text length and format
+                text_length_score = min(1.0, len(extracted_text) / 6.0)  # Optimal around 6 chars
+                ocr_confidence = text_length_score * 0.5 + format_confidence * 0.5
+                
+                # Penalty for obviously wrong text (phone numbers, etc.)
+                if len(extracted_text) > 10 or any(char in extracted_text for char in ['@', '#', '$', '%']):
+                    ocr_confidence *= 0.1
+            
+            # Boost area score based on OCR success
+            boosted_area = area
+            if is_valid:
+                boosted_area *= (1.0 + ocr_confidence * 2.0)  # Strong boost for valid plates
+            elif extracted_text and len(extracted_text) >= 3:
+                boosted_area *= (1.0 + ocr_confidence * 0.5)  # Small boost for readable text
+            else:
+                boosted_area *= 0.5  # Penalty for no readable text
+            
+            verified_candidates.append((x, y, w, h, boosted_area, extracted_text, ocr_confidence))
+            
+        except Exception as e:
+            logger.warning(f"OCR verification failed for candidate {i}: {e}")
+            verified_candidates.append((x, y, w, h, area * 0.3, "", 0.0))  # Penalty for OCR failure
+    
+    # Sort by boosted area score
+    verified_candidates.sort(key=lambda x: x[4], reverse=True)
+    return verified_candidates
+
+# ============================================================================
+# IMAGE ENHANCEMENT AND PROCESSING
+# ============================================================================
+
+def enhance_plate_region(image: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
+    """
+    Apply multiple enhancement techniques to detected plate region
+    
+    Args:
+        image: Input grayscale image
+        x, y, w, h: Region of interest coordinates
+        
+    Returns:
+        Enhanced plate region using multiple processing techniques
+    """
+    # Validate input coordinates
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        logger.warning(f"Invalid coordinates: x={x}, y={y}, w={w}, h={h}")
+        return np.zeros((max(h, 50), max(w, 100)), dtype=np.uint8)
+    
+    # Extract region of interest with bounds checking
+    height, width = image.shape[:2]
+    
+    # Ensure coordinates are within image bounds
+    x = max(0, min(x, width - 1))
+    y = max(0, min(y, height - 1))
+    
+    # Ensure width and height don't exceed image bounds
+    x_end = min(x + w, width)
+    y_end = min(y + h, height)
+    
+    # Recalculate actual width and height
+    w = max(1, x_end - x)
+    h = max(1, y_end - y)
+    
+    roi = image[y:y+h, x:x+w]
+    
+    # Handle empty or invalid ROI
+    if roi.size == 0 or roi.shape[0] == 0 or roi.shape[1] == 0:
+        logger.warning(f"Empty ROI extracted: roi.shape={roi.shape if roi.size > 0 else 'empty'}")
+        # Return proportional fallback based on aspect ratio
+        aspect_ratio = w / h if h > 0 else 2.0
+        fallback_h = 50
+        fallback_w = int(fallback_h * aspect_ratio)
+        return np.zeros((fallback_h, fallback_w), dtype=np.uint8)
+    
+    # Start with a copy of the ROI
+    enhanced_roi = roi.copy()
+    
+    # Basic enhancement: Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    try:
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        enhanced_roi = clahe.apply(enhanced_roi)
+        
+        # Apply bilateral filtering for noise reduction
+        if enhanced_roi.shape[0] >= 5 and enhanced_roi.shape[1] >= 5:
+            enhanced_roi = cv2.bilateralFilter(enhanced_roi, 5, 50, 50)
+        
+        # Simple contrast stretching
+        min_val, max_val = np.min(enhanced_roi), np.max(enhanced_roi)
+        if max_val > min_val:
+            enhanced_roi = ((enhanced_roi - min_val) * 255.0 / (max_val - min_val)).astype(np.uint8)
+        
+    except Exception as e:
+        logger.warning(f"Enhancement failed, using original ROI: {e}")
+        enhanced_roi = roi.copy()
+    
+    return enhanced_roi
+
+# ============================================================================
+# 9-PHASE ACADEMIC PIPELINE
+# ============================================================================
+
+def process_image_through_phases(img_np: np.ndarray) -> Tuple[Dict[str, np.ndarray], List[Tuple[int, int, int, int, float]]]:
+    """
+    Process image through all 9 phases and return processed images and plate candidates
+    
+    Args:
+        img_np: Input image as numpy array
+        
+    Returns:
+        Tuple of (phases_dict, plate_candidates)
+    """
+    phases = {}
+    
+    # Convert to grayscale for processing
+    if len(img_np.shape) == 3:
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_np.copy()
+        
+    phases['original'] = img_np
+    phases['grayscale'] = gray
+    
+    # Phase 2: Image Enhancement
+    enhanced = cv2.equalizeHist(gray)
+    gamma = 1.2
+    gamma_corrected = np.array(255 * (enhanced / 255) ** gamma, dtype='uint8')
+    phases['enhanced'] = gamma_corrected
+    
+    # Phase 3: Image Restoration
+    restored = cv2.bilateralFilter(gamma_corrected, 11, 17, 17)
+    phases['restored'] = restored
+    
+    # Phase 4: Color Image Processing
+    if len(img_np.shape) == 3:
+        hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+        value_channel = hsv[:, :, 2]
+    else:
+        value_channel = gray.copy()
+    phases['color_processed'] = value_channel
+    
+    # Phase 5: Wavelet Transform
+    try:
+        coeffs2 = pywt.dwt2(restored, 'db4')
+        LL, (LH, HL, HH) = coeffs2
+        detail_combined = np.sqrt(LH**2 + HL**2 + HH**2)
+        
+        # Normalize to prevent division by zero
+        detail_min, detail_max = np.min(detail_combined), np.max(detail_combined)
+        if detail_max > detail_min:
+            detail_norm = np.uint8(255 * (detail_combined - detail_min) / (detail_max - detail_min))
+        else:
+            detail_norm = np.zeros_like(detail_combined, dtype=np.uint8)
+    except Exception as e:
+        logger.warning(f"Wavelet transform failed: {e}")
+        detail_norm = restored.copy()
+    
+    phases['wavelet'] = detail_norm
+    
+    # Phase 6: Image Compression
+    h_orig, w_orig = restored.shape
+    # Ensure minimum size to prevent errors
+    new_w, new_h = max(1, w_orig//4), max(1, h_orig//4)
+    compressed = cv2.resize(restored, (new_w, new_h))
+    decompressed = cv2.resize(compressed, (w_orig, h_orig))
+    phases['compressed'] = decompressed
+    
+    # Phase 7: Morphological Processing
+    kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    morph_close = cv2.morphologyEx(restored, cv2.MORPH_CLOSE, kernel_rect)
+    morph_grad = cv2.morphologyEx(morph_close, cv2.MORPH_GRADIENT, kernel_rect)
+    phases['morphological'] = morph_grad
+    
+    # Phase 8: Segmentation
+    adaptive_thresh = cv2.adaptiveThreshold(
+        restored, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    phases['segmented'] = adaptive_thresh
+    
+    # Phase 9: Representation & Description
+    # Try detection on multiple phases to find best results
+    candidates_enhanced = detect_license_plate_regions(enhanced)
+    candidates_restored = detect_license_plate_regions(restored) 
+    candidates_morph = detect_license_plate_regions(morph_grad)
+    
+    # Combine all candidates and remove duplicates
+    all_phase_candidates = []
+    for candidates in [candidates_enhanced, candidates_restored, candidates_morph]:
+        all_phase_candidates.extend(candidates)
+    
+    # Remove duplicates (similar positions)
+    unique_candidates = []
+    for candidate in all_phase_candidates:
+        x, y, w, h, area = candidate
+        is_duplicate = False
+        for existing in unique_candidates:
+            ex, ey, ew, eh, ea = existing
+            # Check if centers are close (within 30 pixels)
+            if abs((x + w/2) - (ex + ew/2)) < 30 and abs((y + h/2) - (ey + eh/2)) < 30:
+                is_duplicate = True
+                # Keep the larger area
+                if area > ea:
+                    unique_candidates.remove(existing)
+                    unique_candidates.append(candidate)
+                break
+        if not is_duplicate:
+            unique_candidates.append(candidate)
+    
+    # Sort by intelligent scoring for license plates
+    def license_plate_score(candidate):
+        if len(candidate) == 6:
+            x, y, w, h, area, method = candidate
+        else:
+            x, y, w, h, area = candidate
+            method = "unknown"
+        
+        # Get image dimensions for position scoring
+        img_height, img_width = enhanced.shape[:2]
+        
+        # Base score from area
+        area_score = area
+        
+        # Extreme penalty for being at image edges (likely false detections)
+        edge_penalty = 1.0
+        if (y <= 5 or x <= 5 or  # Very close to edges
+            (y + h) >= (img_height - 5) or (x + w) >= (img_width - 5) or  # Near opposite edges
+            y < 30 or x < 30 or  # Regular edge detection
+            (y + h) > (img_height - 30) or (x + w) > (img_width - 30)):  # Regular far edges
+            edge_penalty = 0.001  # Even more extreme penalty (99.9% reduction)
+        
+        # Prefer license plates in lower 2/3 of image (where cars are)
+        position_score = 1.0
+        center_y = y + h/2
+        if center_y > img_height * 0.3:  # Lower 70% of image
+            position_score = 2.0  # Strong bonus for car area
+        if center_y > img_height * 0.7:  # Bottom 30% of image
+            position_score = 1.5  # Still good but slightly lower
+        
+        # Prefer reasonable license plate sizes (not too huge)
+        size_score = 1.0
+        if area > 25000:  # Very large areas are likely false positives
+            size_score = 0.2
+        elif area > 15000:  # Large areas are suspicious
+            size_score = 0.4
+        elif 5000 <= area <= 15000:  # Good size range for license plates
+            size_score = 1.5
+        elif 2000 <= area <= 5000:  # Smaller plates (like AAT40)
+            size_score = 1.8  # Higher bonus for smaller realistic plates
+        elif 1000 <= area <= 2000:  # Very small but possible
+            size_score = 1.2
+        
+        # Aspect ratio preference
+        aspect_ratio = w / h
+        aspect_score = 1.0
+        if 3.0 <= aspect_ratio <= 4.5:  # Ideal single-line license plate aspect ratio
+            aspect_score = 1.2
+        elif 1.0 <= aspect_ratio <= 2.0:  # Ideal 2-line license plate aspect ratio
+            aspect_score = 1.3  # Slightly higher bonus for 2-line plates
+        elif 2.0 <= aspect_ratio <= 5.0:  # Acceptable range
+            aspect_score = 1.0
+        elif 0.8 <= aspect_ratio <= 1.0:  # Very square 2-line plates
+            aspect_score = 1.1
+        else:
+            aspect_score = 0.8
+        
+        # Method-specific bonuses with improved scoring
+        method_score = 1.0
+        if method == "2line":  # Two-line plate detection gets very high priority
+            method_score = 3.5
+        elif method == "bus":  # Bus-specific detection gets high priority
+            method_score = 3.0
+        elif method == "bright":  # Light text detection for buses
+            method_score = 2.5
+        elif method in ["dark", "contrast"]:  # Good for regular license plates
+            method_score = 2.0
+        elif method == "adaptive":  # Adaptive thresholding is good for varied lighting
+            method_score = 1.8
+        elif method == "edge":  # Edge detection picks up borders well
+            method_score = 1.6
+        
+        # Additional scoring bonus for license plate-like characteristics
+        characteristic_bonus = 1.0
+        
+        # Bonus for typical license plate positioning (lower part of image, not edges)
+        center_x = x + w/2
+        center_y = y + h/2
+        
+        # Strong penalty for edge positions (likely false detections)
+        if (x <= 10 or y <= 10 or 
+            (x + w) >= (img_width - 10) or (y + h) >= (img_height - 10)):
+            characteristic_bonus = 0.01  # Extreme penalty for edge detections
+        
+        # Bonus for license plate typical positions
+        elif (img_height * 0.3 <= center_y <= img_height * 0.9 and  # Lower 60% of image
+              img_width * 0.1 <= center_x <= img_width * 0.9):       # Central 80% horizontally
+            characteristic_bonus = 1.5
+        
+        # Bonus for realistic license plate sizes in the image
+        image_coverage = area / (img_width * img_height)
+        if 0.002 <= image_coverage <= 0.03:  # 0.2% to 3% of image area is ideal for plates
+            characteristic_bonus *= 1.3
+        
+        return area_score * edge_penalty * position_score * size_score * aspect_score * method_score * characteristic_bonus
+    
+    unique_candidates.sort(key=license_plate_score, reverse=True)
+    plate_candidates = unique_candidates[:10]
+    
+    # Draw results on original image
+    result_img = img_np.copy()
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    
+    for i, (x, y, w, h, area) in enumerate(plate_candidates):
+        color = colors[i % len(colors)]
+        cv2.rectangle(result_img, (x, y), (x+w, y+h), color, 3)
+        cv2.putText(result_img, f'Candidate {i+1}', (x, y-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    
+    phases['detection_result'] = result_img
+    
+    return phases, plate_candidates
+
+# ============================================================================
+# TEXT EXTRACTION AND STATE IDENTIFICATION
+# ============================================================================
+
+def extract_plate_text(image: np.ndarray, ocr_model, ocr_engine: str) -> str:
+    """Extract text from license plate using available OCR engine"""
+    if ocr_engine == "paddleocr" and ocr_model:
+        result = extract_license_plate_text_correct(ocr_model, image)
+        return result if result else ""
+    else:
+        return ""
+
+def identify_state(plate_text: str) -> str:
+    """Identify Malaysian state from license plate text"""
+    if not plate_text:
+        return "Unknown"
+    
+    clean_plate = plate_text.replace(' ', '').upper()
+    
+    state_map = {
+        # Single letter states
+        "A": "Perak", "B": "Selangor", "C": "Pahang", "D": "Kelantan",
+        "F": "W.P. Putrajaya", "J": "Johor", "K": "Kedah", "L": "W.P. Labuan",
+        "M": "Melaka", "N": "Negeri Sembilan", "P": "Pulau Pinang", "Q": "Sarawak",
+        "R": "Perlis", "S": "Sabah", "T": "Terengganu", "V": "W.P. Kuala Lumpur",
+        "W": "W.P. Kuala Lumpur", "Z": "Military",
+        
+        # Multi-letter prefixes
+        "KV": "Langkawi", "EV": "Special Series", "FFF": "Special Series",
+        "VIP": "Special Series", "GOLD": "Special Series", "LIMO": "Special Series",
+        "MADANI": "Special Series", "PETRA": "Special Series",
+        "U": "Special Series", "X": "Special Series", "Y": "Special Series",
+        "H": "Taxi"
+    }
+    
+    # Check multi-letter prefixes first (longer matches)
+    for prefix in sorted(state_map.keys(), key=len, reverse=True):
+        if clean_plate.startswith(prefix):
+            return state_map[prefix]
+    
+    # Default to unknown
+    return "Unknown"
+
+def classify_vehicle(image: np.ndarray) -> str:
+    """Classify vehicle type (placeholder implementation)"""
+    # This is a placeholder - you can implement actual vehicle classification here
+    # For now, just return "Car" as default
+    return "Car"
+
+def validate_uploaded_file(uploaded_file) -> bool:
+    """Validate uploaded file"""
+    if uploaded_file is None:
+        return False
+    
+    # Check file size (limit to 10MB)
+    if uploaded_file.size > 10 * 1024 * 1024:
+        st.error(f"File {uploaded_file.name} is too large (max 10MB)")
+        return False
+    
+    return True
+
+# ============================================================================
+# STREAMLIT USER INTERFACE
+# ============================================================================
+
+# Streamlit App Configuration
+st.set_page_config(
+    page_title="Malaysian LPR System", 
+    page_icon="🚗",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        text-align: center;
+        padding: 1rem 0;
+        background: linear-gradient(90deg, #1f77b4, #2e8b57);
+        color: white;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+    }
+    .metric-container {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+    }
+    .success-box {
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        color: #155724;
+        padding: 1rem;
+        border-radius: 5px;
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="main-header"><h1>🚗 Malaysian License Plate Recognition System</h1><p>Complete system with 9-phase image processing and OCR recognition</p></div>', unsafe_allow_html=True)
+
+# Initialize OCR
+with st.spinner("Loading OCR model..."):
+    ocr_model, ocr_engine = load_ocr_model()
+
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ System Configuration")
+    
+    # Processing mode selection
+    processing_mode = st.radio(
+        "Select Processing Mode:",
+        ["Complete Analysis", "Quick Recognition", "Phase-by-Phase View"],
+        help="Choose how detailed you want the analysis to be"
+    )
+    
+    st.header("ℹ️ System Information")
+    st.markdown(f"""
+    **OCR Engine:** {OCR_ENGINE.upper() if OCR_ENGINE else 'None Available'}
+    **Status:** {'🟢 Ready' if OCR_ENGINE else '🔴 OCR Not Available'}
+    
+    **Processing Phases:**
+    1. 📥 Image Acquisition
+    2. ✨ Image Enhancement
+    3. 🔧 Image Restoration
+    4. 🌈 Color Processing
+    5. 🌊 Wavelet Transform
+    6. 📦 Compression Handling
+    7. 🧱 Morphological Processing
+    8. 🧩 Segmentation
+    9. 🧬 Representation & Description
+    10. 🔤 OCR Recognition
+    """)
+    
+    # System requirements
+    st.header("📋 Requirements")
+    st.markdown("""
+    - **Image formats:** PNG, JPG, JPEG
+    - **Max file size:** 10MB per image
+    - **Recommended:** Clear, well-lit images
+    - **Best results:** Front-facing plates
+    """)
+
+# Main interface
+tab1, tab2, tab3, tab4 = st.tabs(["📁 Upload & Process", "🔍 Phase Analysis", "📊 Results", "ℹ️ Help"])
+
+with tab1:
+    st.header("Image Upload and Processing")
+    
+    # File uploader with validation
+    uploaded_files = st.file_uploader(
+        "Choose license plate images", 
+        type=["png", "jpg", "jpeg"], 
+        accept_multiple_files=True,
+        help="Upload one or more images containing Malaysian license plates (max 10MB each)"
+    )
+    
+    if uploaded_files:
+        # Validate all files
+        valid_files = [f for f in uploaded_files if validate_uploaded_file(f)]
+        
+        if valid_files:
+            st.success(f"✅ {len(valid_files)} valid image(s) uploaded successfully!")
+            
+            # Show file details
+            with st.expander("📋 File Details", expanded=False):
+                for file in valid_files:
+                    st.write(f"• **{file.name}** ({file.size / 1024:.1f} KB)")
+            
+            # Initialize session state
+            if "processing_results" not in st.session_state:
+                st.session_state.processing_results = []
+            
+            # Processing options
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                process_button = st.button("🚀 Start Processing", type="primary", use_container_width=True)
+            with col2:
+                clear_button = st.button("🗑️ Clear Results", use_container_width=True)
+            
+            if clear_button:
+                st.session_state.processing_results.clear()
+                st.success("Results cleared!")
+                st.rerun()
+            
+            if process_button:
+                st.session_state.processing_results.clear()
+                
+                # Create progress tracking
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                results_container = st.empty()
+                
+                for i, uploaded_file in enumerate(valid_files):
+                    status_text.text(f"Processing {uploaded_file.name}... ({i+1}/{len(valid_files)})")
+                    
+                    try:
+                        # Load and validate image
+                        img = Image.open(uploaded_file)
+                        img_np = np.array(img)
+                        
+                        if img_np.size == 0:
+                            st.error(f"Invalid image: {uploaded_file.name}")
+                            continue
+                        
+                        # Process through all phases
+                        with st.spinner(f"Processing phases for {uploaded_file.name}..."):
+                            phases, plate_candidates = process_image_through_phases(img_np)
+                        
+                        # ENHANCED: Use OCR verification pipeline for better results
+                        plate_text = ""
+                        best_candidate = None
+                        
+                        if plate_candidates and ocr_model:
+                            # Run OCR verification on top candidates
+                            verified_candidates = ocr_verification_pipeline(ocr_model, ocr_engine, plate_candidates, phases['restored'])
+                            
+                            if verified_candidates:
+                                # Get the best verified candidate
+                                best_candidate = verified_candidates[0]
+                                x, y, w, h, area, extracted_text, ocr_confidence = best_candidate
+                                
+                                # Use extracted text if available, otherwise fallback to basic OCR
+                                if extracted_text:
+                                    plate_text = extracted_text
+                                else:
+                                    # Fallback: basic OCR on best geometric candidate
+                                    plate_roi = enhance_plate_region(phases['restored'], x, y, w, h)
+                                    plate_text = extract_plate_text(plate_roi, ocr_model, ocr_engine)
+                            else:
+                                # Fallback: basic OCR on first candidate
+                                x, y, w, h, _ = plate_candidates[0]
+                                plate_roi = enhance_plate_region(phases['restored'], x, y, w, h)
+                                plate_text = extract_plate_text(plate_roi, ocr_model, ocr_engine)
+                        
+                        # Identify state and vehicle type
+                        state = identify_state(plate_text)
+                        vehicle_type = classify_vehicle(img_np)
+                        
+                        # Store results
+                        result_data = {
+                            "filename": uploaded_file.name,
+                            "phases": phases,
+                            "plate_candidates": plate_candidates,
+                            "plate_text": plate_text,
+                            "state": state,
+                            "vehicle_type": vehicle_type,
+                            "original_image": img,
+                        }
+                        
+                        st.session_state.processing_results.append(result_data)
+                        
+                        # Show quick preview
+                        with results_container.container():
+                            st.success(f"✅ Processed: {uploaded_file.name}")
+                            if plate_text:
+                                st.info(f"🔢 Detected: **{plate_text}** ({state})")
+                            else:
+                                st.warning("🔍 No text detected")
+                        
+                    except Exception as e:
+                        st.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
+                        logger.error(f"Processing error for {uploaded_file.name}: {e}")
+                    
+                    progress_bar.progress((i + 1) / len(valid_files))
+                
+                st.balloons()
+        else:
+            st.error("❌ No valid files uploaded. Please check file sizes and formats.")
+
+with tab2:
+    st.header("🔍 Image Processing Phase Analysis")
+    
+    if "processing_results" in st.session_state and st.session_state.processing_results:
+        # Select image for phase analysis
+        selected_idx = st.selectbox(
+            "Select image for phase analysis:",
+            range(len(st.session_state.processing_results)),
+            format_func=lambda x: st.session_state.processing_results[x]["filename"]
+        )
+        
+        if selected_idx is not None:
+            result = st.session_state.processing_results[selected_idx]
+            phases = result["phases"]
+            
+            st.subheader(f"📊 Phase Analysis: {result['filename']}")
+            
+            # Phase information
+            phase_info = [
+                ("original", "📥 Phase 1: Image Acquisition", "Original input image"),
+                ("enhanced", "✨ Phase 2: Image Enhancement", "Histogram equalization + gamma correction"),
+                ("restored", "🔧 Phase 3: Image Restoration", "Bilateral filtering for noise reduction"),
+                ("color_processed", "🌈 Phase 4: Color Processing", "HSV Value channel extraction"),
+                ("wavelet", "🌊 Phase 5: Wavelet Transform", "Detail coefficients highlighting edges"),
+                ("compressed", "📦 Phase 6: Compression Effects", "Compression simulation"),
+                ("morphological", "🧱 Phase 7: Morphological Processing", "Gradient to enhance boundaries"),
+                ("segmented", "🧩 Phase 8: Segmentation", "Adaptive thresholding"),
+                ("detection_result", "🧬 Phase 9: Detection Result", "License plate detection")
+            ]
+            
+            # Display phases in a grid
+            for i in range(0, len(phase_info), 2):
+                col1, col2 = st.columns(2)
+                
+                # Left column
+                if i < len(phase_info):
+                    key, title, description = phase_info[i]
+                    with col1:
+                        if key in phases:
+                            if key in ["original", "detection_result"]:
+                                st.image(phases[key], caption=title, use_container_width=True)
+                            else:
+                                st.image(phases[key], caption=title, channels="GRAY", use_container_width=True)
+                            st.markdown(f"*{description}*")
+                            st.markdown("---")
+                
+                # Right column
+                if i + 1 < len(phase_info):
+                    key, title, description = phase_info[i + 1]
+                    with col2:
+                        if key in phases:
+                            if key in ["original", "detection_result"]:
+                                st.image(phases[key], caption=title, use_container_width=True)
+                            else:
+                                st.image(phases[key], caption=title, channels="GRAY", use_container_width=True)
+                            st.markdown(f"*{description}*")
+                            st.markdown("---")
+    else:
+        st.info("👆 Please upload and process images first to view phase analysis.")
+
+with tab3:
+    st.header("📊 Recognition Results")
+    
+    if "processing_results" in st.session_state and st.session_state.processing_results:
+        # Summary statistics first
+        st.subheader("📈 Processing Summary")
+        
+        total_processed = len(st.session_state.processing_results)
+        successful_detections = sum(1 for r in st.session_state.processing_results if r["plate_text"])
+        total_candidates = sum(len(r["plate_candidates"]) for r in st.session_state.processing_results)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Images Processed", total_processed)
+        
+        with col2:
+            st.metric("Successful Detections", successful_detections)
+        
+        with col3:
+            success_rate = (successful_detections / total_processed * 100) if total_processed > 0 else 0
+            st.metric("Success Rate", f"{success_rate:.1f}%")
+        
+        st.markdown("---")
+        
+        # Detailed results
+        for i, result in enumerate(st.session_state.processing_results):
+            with st.expander(f"🖼️ Result {i+1}: {result['filename']}", expanded=i==0):
+                col1, col2 = st.columns([1, 2])
+                
+                with col1:
+                    st.image(result["original_image"], caption=result["filename"], use_container_width=True)
+                    
+                    # Show detected plate candidates
+                    if result["plate_candidates"]:
+                        st.markdown("**🎯 Detected Plate Candidates:**")
+                        for j, (x, y, w, h, area) in enumerate(result["plate_candidates"]):
+                            enhanced_plate = enhance_plate_region(result["phases"]["restored"], x, y, w, h)
+                            st.image(enhanced_plate, caption=f"Candidate {j+1} (Area: {area:.0f})", channels="GRAY")
+                
+                with col2:
+                    st.markdown("### 🎯 Recognition Results")
+                    
+                    # Display results with improved styling
+                    plate_status = "✅ Detected" if result['plate_text'] else "❌ Not detected"
+                    confidence_color = "#2e8b57" if result['plate_text'] else "#dc3545"
+                    
+                    info_html = f"""
+                    <div style="background: linear-gradient(135deg, #f0f2f6, #e8f4f8); padding: 20px; border-radius: 15px; margin: 10px 0; border-left: 5px solid {confidence_color};">
+                        <h4 style="margin: 0 0 15px 0; color: #1f77b4;">🔢 License Plate Recognition</h4>
+                        <div style="background: white; padding: 15px; border-radius: 10px; margin: 10px 0;">
+                            <p style="font-size: 24px; font-weight: bold; margin: 0; color: #333; text-align: center;">
+                                {result['plate_text'] if result['plate_text'] else 'NO TEXT DETECTED'}
+                            </p>
+                            <p style="text-align: center; margin: 5px 0 0 0; color: {confidence_color}; font-weight: bold;">
+                                {plate_status}
+                            </p>
+                        </div>
+                    </div>
+                    
+                    <div style="background: linear-gradient(135deg, #e8f5e8, #f0fff0); padding: 15px; border-radius: 10px; margin: 10px 0; border-left: 5px solid #2e8b57;">
+                        <h4 style="margin: 0 0 10px 0; color: #2e8b57;">📍 State/Region</h4>
+                        <p style="font-size: 18px; font-weight: bold; margin: 0; color: #333;">
+                            {result['state']}
+                        </p>
+                    </div>
+                    
+                    <div style="background: linear-gradient(135deg, #fff0e6, #fffaf0); padding: 15px; border-radius: 10px; margin: 10px 0; border-left: 5px solid #ff8c00;">
+                        <h4 style="margin: 0 0 10px 0; color: #ff8c00;">🚗 Vehicle Classification</h4>
+                        <p style="font-size: 18px; font-weight: bold; margin: 0; color: #333;">
+                            {result['vehicle_type']}
+                        </p>
+                    </div>
+                    """
+                    st.markdown(info_html, unsafe_allow_html=True)
+                    
+                    # Technical details
+                    st.markdown("### 📈 Technical Details")
+                    if result["plate_candidates"]:
+                        for j, (x, y, w, h, area) in enumerate(result["plate_candidates"]):
+                            with st.container():
+                                st.markdown(f"""
+                                **🎯 Candidate {j+1}:**
+                                - **Position:** ({x}, {y})
+                                - **Size:** {w} × {h} pixels
+                                - **Area:** {area:.0f} pixels²
+                                - **Aspect Ratio:** {w/h:.2f}
+                                - **Confidence:** {'High' if j == 0 else 'Medium' if j == 1 else 'Low'}
+                                """)
+                    else:
+                        st.warning("⚠️ No license plate candidates detected")
+                        st.markdown("""
+                        **Possible reasons:**
+                        - Image quality too low
+                        - License plate not clearly visible
+                        - Unusual plate format
+                        - Poor lighting conditions
+                        """)
+    else:
+        st.info("👆 Please upload and process images first to view results.")
+
+with tab4:
+    st.header("ℹ️ Help & Information")
+    
+    st.markdown("""
+    ## 🚗 Malaysian License Plate Recognition System
+    
+    This system uses advanced computer vision and OCR techniques to detect and recognize Malaysian license plates.
+    
+    ### 🎯 How It Works
+    
+    1. **Image Upload**: Upload clear images containing Malaysian license plates
+    2. **9-Phase Processing**: Images go through comprehensive preprocessing
+    3. **Plate Detection**: Computer vision algorithms locate potential license plates
+    4. **OCR Recognition**: PaddleOCR extracts text from detected plates
+    5. **State Identification**: System identifies the issuing state/region
+    
+    ### 📋 Processing Phases Explained
+    
+    | Phase | Description | Purpose |
+    |-------|-------------|---------|
+    | 1️⃣ **Acquisition** | Original image input | Starting point |
+    | 2️⃣ **Enhancement** | Histogram equalization + gamma correction | Improve contrast |
+    | 3️⃣ **Restoration** | Bilateral filtering | Reduce noise while preserving edges |
+    | 4️⃣ **Color Processing** | HSV value channel extraction | Isolate brightness information |
+    | 5️⃣ **Wavelet Transform** | Detail coefficient analysis | Highlight edges and textures |
+    | 6️⃣ **Compression** | Simulate compression effects | Handle compressed images |
+    | 7️⃣ **Morphological** | Gradient operations | Enhance object boundaries |
+    | 8️⃣ **Segmentation** | Adaptive thresholding | Create binary image |
+    | 9️⃣ **Detection** | Contour analysis | Locate license plate regions |
+    
+    ### 🏷️ Malaysian License Plate Format
+    
+    Malaysian license plates follow specific patterns:
+    
+    - **Standard Format**: [State Code][Number][Letter(s)]
+    - **Examples**: 
+      - `WJJ1234A` (Kuala Lumpur)
+      - `BJH5678` (Selangor)
+      - `PGK9999Z` (Penang)
+    
+    ### 🗺️ State Codes
+    
+    | Code | State/Territory |
+    |------|----------------|
+    | A | Perak |
+    | B | Selangor |
+    | C | Pahang |
+    | D | Kelantan |
+    | F | Putrajaya |
+    | J | Johor |
+    | K | Kedah |
+    | L | Labuan |
+    | M | Melaka |
+    | N | Negeri Sembilan |
+    | P | Penang |
+    | Q | Sarawak |
+    | R | Perlis |
+    | S | Sabah |
+    | T | Terengganu |
+    | V/W | Kuala Lumpur |
+    | Z | Military |
+    
+    ### 💡 Tips for Best Results
+    
+    1. **Image Quality**:
+       - Use high-resolution images (minimum 800x600)
+       - Ensure good lighting conditions
+       - Avoid blurry or motion-blurred images
+    
+    2. **Plate Visibility**:
+       - Capture plates straight-on (avoid angles)
+       - Ensure the entire plate is visible
+       - Clean plates work better than dirty ones
+    
+    3. **File Format**:
+       - Supported: PNG, JPG, JPEG
+       - Maximum size: 10MB per file
+       - Multiple files can be processed at once
+    
+    ### ⚠️ Limitations
+    
+    - **OCR Accuracy**: Depends on image quality and plate condition
+    - **Detection Range**: Works best with standard Malaysian plates
+    - **Special Plates**: Custom or diplomatic plates may not be recognized
+    - **Processing Time**: Complex images may take longer to process
+    
+    ### 🔧 Troubleshooting
+    
+    **No Text Detected?**
+    - Check image quality and lighting
+    - Ensure plate is clearly visible
+    - Try different image angles
+    
+    **Wrong State Identification?**
+    - Verify the detected text is correct
+    - Some special series plates may not follow standard patterns
+    
+    **Slow Processing?**
+    - Large images take more time
+    - Multiple files are processed sequentially
+    - OCR model loading happens once per session
+    
+    ### 🚀 Running the Application
+    
+    **Important**: This is a Streamlit application that must be run using:
+    
+    ```bash
+    streamlit run IPPR.py
+    ```
+    
+    **DO NOT** run with `python IPPR.py` as this will cause ScriptRunContext errors.
+    
+    ### 📞 Support
+    
+    If you encounter issues:
+    1. Check the error messages in the interface
+    2. Verify your image meets the requirements
+    3. Ensure PaddleOCR is properly installed
+    4. Check the console for detailed error logs
+    """)
+    
+    # System status check
+    st.markdown("---")
+    st.subheader("🔍 System Status Check")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**📦 Dependencies:**")
+        try:
+            import cv2
+            st.success("✅ OpenCV installed")
+        except ImportError:
+            st.error("❌ OpenCV not found")
+        
+        try:
+            import numpy as np
+            st.success("✅ NumPy installed")
+        except ImportError:
+            st.error("❌ NumPy not found")
+        
+        try:
+            from PIL import Image
+            st.success("✅ PIL/Pillow installed")
+        except ImportError:
+            st.error("❌ PIL/Pillow not found")
+        
+        try:
+            import pywt
+            st.success("✅ PyWavelets installed")
+        except ImportError:
+            st.error("❌ PyWavelets not found")
+    
+    with col2:
+        st.markdown("**🔤 OCR Status:**")
+        if OCR_ENGINE:
+            st.success(f"✅ {OCR_ENGINE.upper()} loaded successfully")
+            st.info("🎯 Ready for text recognition")
+        else:
+            st.error("❌ No OCR engine available")
+            st.warning("⚠️ Text recognition will not work")
+        
+        st.markdown("**💾 Session State:**")
+        if "processing_results" in st.session_state:
+            result_count = len(st.session_state.processing_results)
+            st.info(f"📊 {result_count} results in memory")
+        else:
+            st.info("🔄 No results stored")
+
+# Footer
+st.markdown("---")
+footer_html = f"""
+<div style='text-align: center; padding: 20px; background: linear-gradient(90deg, #f8f9fa, #e9ecef); border-radius: 10px; margin-top: 2rem;'>
+    <h4 style='color: #495057; margin: 0 0 10px 0;'>🚗 Malaysian License Plate Recognition System</h4>
+    <p style='color: #6c757d; margin: 0;'>
+        OCR Engine: <strong>{OCR_ENGINE.upper() if OCR_ENGINE else 'None'}</strong> | 
+        9-Phase Image Processing Pipeline | 
+        Built with Streamlit & OpenCV
+    </p>
+    <p style='color: #6c757d; margin: 10px 0 0 0; font-size: 0.9em;'>
+        💡 Remember to run with: <code>streamlit run IPPR.py</code>
+    </p>
+</div>
+"""
+st.markdown(footer_html, unsafe_allow_html=True)
