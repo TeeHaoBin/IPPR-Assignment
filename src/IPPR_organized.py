@@ -54,6 +54,7 @@ def load_ocr_model():
         
         # Check PaddleOCR version and initialize accordingly
         ocr_model = PaddleOCR(
+            use_angle_cls=True,
             use_doc_orientation_classify=False, 
             use_doc_unwarping=False, 
             use_textline_orientation=False,
@@ -237,17 +238,18 @@ def find_plate_candidates_from_binary(binary_image: np.ndarray, original_image: 
         aspect_ratio = w / float(h)
         area_ratio = (w * h) / img_area
         
-        # 1. Aspect ratio check (support both single-line and 2-line)
-        valid_single_line = 2.0 <= aspect_ratio <= 5.0  # Standard plates
-        valid_two_line = 1.0 <= aspect_ratio <= 2.5      # 2-line plates like WSL/2956
-        valid_square_2line = 0.8 <= aspect_ratio <= 1.2  # Very square 2-line plates
-        valid_aspect = valid_single_line or valid_two_line or valid_square_2line
+        # 1. IMPROVED aspect ratio check (better motorcycle support)
+        valid_single_line = 2.0 <= aspect_ratio <= 5.5  # Standard car plates
+        valid_two_line = 1.0 <= aspect_ratio <= 2.8      # 2-line plates like WSL/2956  
+        valid_square_2line = 0.7 <= aspect_ratio <= 1.3  # Square motorcycle plates
+        valid_motorcycle = 1.3 <= aspect_ratio <= 2.2    # Typical motorcycle range
+        valid_aspect = valid_single_line or valid_two_line or valid_square_2line or valid_motorcycle
         
-        # 2. Size check (percentage of image area - more adaptive)
-        valid_size = 0.0005 <= area_ratio <= 0.08  # 0.05% to 8% of image
+        # 2. RELAXED size check (better for small motorcycle plates)
+        valid_size = 0.0003 <= area_ratio <= 0.10  # LOWERED minimum from 0.0005 to 0.0003
         
-        # 3. Minimum dimensions (absolute minimums)
-        valid_dimensions = w > 40 and h > 20
+        # 3. LOWERED minimum dimensions for motorcycles
+        valid_dimensions = w > 30 and h > 15  # REDUCED from w>40, h>20
         
         # 4. Maximum dimensions (prevent huge false positives)
         max_w = binary_image.shape[1] * 0.6  # Max 60% of image width
@@ -461,12 +463,12 @@ def detect_license_plate_regions(image: np.ndarray) -> List[Tuple[int, int, int,
     except:
         pass
     
-    # Method 7: Two-line license plate detection (e.g., WSL\n2956)
+    # Method 7: Enhanced two-line license plate detection (motorcycles)
     try:
         # Apply adaptive threshold optimized for 2-line plates
         adaptive_2line = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 3)
         
-        # Use vertical morphological operations to connect stacked text
+        # MOTORCYCLE-SPECIFIC: Use vertical morphological operations to connect stacked text
         kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 8))  # Tall kernel for vertical connection
         morph_2line = cv2.morphologyEx(adaptive_2line, cv2.MORPH_CLOSE, kernel_vertical)
         
@@ -484,6 +486,35 @@ def detect_license_plate_regions(image: np.ndarray) -> List[Tuple[int, int, int,
         
         candidates_2line = find_plate_candidates_from_binary(morph_2line, image)
         all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "2line") for c in candidates_2line])
+    except:
+        pass
+    
+    # Method 8: MOTORCYCLE-SPECIFIC detection (small, square plates)
+    try:
+        # Use smaller, more aggressive thresholding for small motorcycle plates
+        motorcycle_thresh = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 4)
+        
+        # Motorcycle plates are typically smaller and more square
+        # Use smaller morphological kernels suited for motorcycle text size
+        kernel_moto_h = cv2.getStructuringElement(cv2.MORPH_RECT, (6, 2))  # Smaller horizontal connection
+        kernel_moto_v = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 6))  # Smaller vertical connection
+        
+        # Process for horizontal text connection first
+        moto_processed = cv2.morphologyEx(motorcycle_thresh, cv2.MORPH_CLOSE, kernel_moto_h)
+        
+        # Then vertical connection for two-line format
+        moto_processed = cv2.morphologyEx(moto_processed, cv2.MORPH_CLOSE, kernel_moto_v)
+        
+        # Final connection with medium kernel
+        kernel_final = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 8))
+        moto_processed = cv2.morphologyEx(moto_processed, cv2.MORPH_CLOSE, kernel_final)
+        
+        # Light cleanup to remove small noise but preserve small plates
+        kernel_cleanup = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        moto_processed = cv2.morphologyEx(moto_processed, cv2.MORPH_OPEN, kernel_cleanup)
+        
+        candidates_motorcycle = find_plate_candidates_from_binary(moto_processed, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "motorcycle") for c in candidates_motorcycle])
     except:
         pass
     
@@ -521,16 +552,12 @@ def validate_malaysian_plate_format(text: str) -> Tuple[bool, float, str]:
     
     clean_text = re.sub(r'[^A-Z0-9]', '', text.upper())
     
-    # Malaysian plate patterns
+    # Malaysian plate patterns - CORRECTED based on actual rules
     patterns = [
-        # Standard format: ABC1234, A1234B, etc.
-        (r'^[A-Z]{1,3}[0-9]{1,4}[A-Z]?$', 0.9, "standard"),
-        # 2-line format: ABC\n1234 or AB\n1234
-        (r'^[A-Z]{1,3}[0-9]{1,4}$', 0.8, "two_line"),
-        # Special series: numbers only
-        (r'^[0-9]{1,6}$', 0.6, "numeric"),
-        # Government/special: mixed patterns
-        (r'^[A-Z0-9]{4,8}$', 0.7, "mixed"),
+        # Standard format with suffix: A1A, ABC1234A, WCC9831A (start with alphabet(s), 1-4 integers, optional 1 alphabet)
+        (r'^[A-Z]+[0-9]{1,4}[A-Z]$', 0.95, "standard_with_suffix"),
+        # Standard format: A1, ABC1234, WCC9831, BLR83 (start with alphabet(s), 1-4 integers)
+        (r'^[A-Z]+[0-9]{1,4}$', 0.90, "standard"),
     ]
     
     for pattern, confidence, format_type in patterns:
@@ -639,10 +666,12 @@ def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional
             # Standard PaddleOCR format: list of list of [bbox, (text, confidence)]
             if results[0] is not None:
                 texts_and_scores = []
-                for detection in results[0]:
+                print(f"🔍 Raw OCR found {len(results[0])} detections:")
+                for i, detection in enumerate(results[0], 1):
                     if len(detection) >= 2:
                         text, confidence = detection[1]
                         texts_and_scores.append((text, confidence))
+                        print(f"  {i}. '{text}' (raw confidence: {confidence:.4f})")
                 
                 if texts_and_scores:
                     # Sort by confidence to get reliable texts first
@@ -651,8 +680,18 @@ def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional
                     # Try to find single complete plate text first
                     for text, score in texts_and_scores:
                         clean_text = re.sub(r'[^A-Z0-9]', '', text.strip().upper())
-                        if len(clean_text) >= 5 and score > 0.7:  # High confidence complete plate
-                            return clean_text
+                        if len(clean_text) >= 4 and score > 0.6:  # LOWERED: More lenient for single plates
+                            print(f"🎯 Single plate candidate: '{clean_text}' (score={score:.3f})")
+                            
+                            # VALIDATE FORMAT before accepting single plate
+                            is_valid, format_conf, format_type = validate_malaysian_plate_format(clean_text)
+                            print(f"   Format validation: valid={is_valid}, conf={format_conf:.3f}, type={format_type}")
+                            
+                            if is_valid:
+                                print(f"   ✅ Single plate accepted: '{clean_text}'")
+                                return clean_text
+                            else:
+                                print(f"   ❌ Single plate rejected: invalid format - will try 2-line processing")
                     
                     # ENHANCED 2-LINE PROCESSING: Better line detection and combination
                     if len(texts_and_scores) >= 2:
@@ -672,7 +711,7 @@ def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional
                                 text, confidence = detection[1]
                                 clean_text = re.sub(r'[^A-Z0-9]', '', text.strip().upper())
                                 
-                                if len(clean_text) >= 1 and confidence > 0.3:  # Lower threshold for 2-line
+                                if len(clean_text) >= 1 and confidence > 0.2:  # LOWERED: Even more lenient for 2-line parts
                                     # Calculate center coordinates
                                     center_y = sum([point[1] for point in bbox]) / 4
                                     center_x = sum([point[0] for point in bbox]) / 4
@@ -723,11 +762,11 @@ def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional
                                 combined_text = bbox_texts[0][0] + bbox_texts[1][0]
                                 avg_confidence = (bbox_texts[0][1] + bbox_texts[1][1]) / 2
                                 
-                                if len(combined_text) >= 4 and avg_confidence > 0.4:
+                                if len(combined_text) >= 3 and avg_confidence > 0.3:  # LOWERED: More lenient fallback
                                     best_combination = combined_text
                                     best_confidence = avg_confidence
                             
-                            if best_combination and best_confidence > 0.4:
+                            if best_combination and best_confidence > 0.3:  # LOWERED: Accept more combinations
                                 return best_combination
                     
                     # Fallback: use best single detection
@@ -750,54 +789,194 @@ def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional
         st.error(f"OCR Error: {str(e)}")
         return None
 
-def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, original_image: np.ndarray) -> List[Tuple]:
-    """Run OCR verification on top candidates and filter based on text quality"""
+def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phases_dict: Dict) -> List[Tuple]:
+    """Run OCR verification on top candidates using multiple phases for better results"""
     if not candidates or ocr_model is None:
         return [(c[0], c[1], c[2], c[3], c[4], "", 0.0) for c in candidates]
     
     verified_candidates = []
     
+    # Define OCR phases to try (in order of preference)
+    ocr_phases = [
+        ("restored", "Phase 3: Bilateral filtered"),
+        ("enhanced", "Phase 2: Histogram equalized"), 
+        ("color_processed", "Phase 4: HSV Value channel")
+    ]
+    
     # Process top candidates (limit to save processing time)
     for i, (x, y, w, h, area) in enumerate(candidates[:8]):
         try:
-            # Extract and enhance the region
-            enhanced_roi = enhance_plate_region(original_image, x, y, w, h)
+            best_text = ""
+            best_confidence = 0.0
+            best_phase = ""
+            all_attempts = []
             
-            # Run OCR
-            extracted_text = extract_plate_text(enhanced_roi, ocr_model, ocr_engine)
+            # Try OCR on multiple phases
+            for phase_key, phase_name in ocr_phases:
+                if phase_key not in phases_dict:
+                    continue
+                    
+                try:
+                    # Extract ROI from this phase
+                    phase_image = phases_dict[phase_key]
+                    enhanced_roi = enhance_plate_region(phase_image, x, y, w, h)
+                    
+                    # Run OCR on this phase
+                    extracted_text = extract_plate_text(enhanced_roi, ocr_model, ocr_engine)
+                    
+                    if extracted_text:
+                        # Validate format
+                        is_valid, format_confidence, format_type = validate_malaysian_plate_format(extracted_text)
+                        
+                        # Calculate confidence for this attempt
+                        text_length_score = min(1.0, len(extracted_text) / 6.0)
+                        attempt_confidence = text_length_score * 0.5 + format_confidence * 0.5
+                        
+                        # Bonus for valid Malaysian plate format
+                        if is_valid:
+                            attempt_confidence *= 1.5
+                        
+                        all_attempts.append({
+                            'text': extracted_text,
+                            'confidence': attempt_confidence,
+                            'phase': phase_name,
+                            'is_valid': is_valid,
+                            'format_type': format_type
+                        })
+                        
+                        logger.info(f"Candidate {i+1} - {phase_name}: '{extracted_text}' (conf={attempt_confidence:.3f}, valid={is_valid})")
+                        print(f"🔍 Candidate {i+1} - {phase_name}: '{extracted_text}' (conf={attempt_confidence:.3f}, valid={is_valid})")
+                        
+                        # Update best result if this is better
+                        if attempt_confidence > best_confidence:
+                            best_text = extracted_text
+                            best_confidence = attempt_confidence
+                            best_phase = phase_name
+                            
+                except Exception as phase_error:
+                    logger.warning(f"OCR failed on {phase_name} for candidate {i}: {phase_error}")
+                    continue
             
-            # Validate format
-            is_valid, format_confidence, format_type = validate_malaysian_plate_format(extracted_text)
-            
-            # Calculate overall OCR confidence
-            ocr_confidence = 0.0
-            if extracted_text:
-                # Base confidence from text length and format
-                text_length_score = min(1.0, len(extracted_text) / 6.0)  # Optimal around 6 chars
-                ocr_confidence = text_length_score * 0.5 + format_confidence * 0.5
+            # MAJORITY VOTING: When scores are similar, use majority vote
+            if all_attempts:
+                attempts_str = [(a['text'], f"{a['confidence']:.3f}") for a in all_attempts]
+                logger.info(f"Candidate {i+1} OCR attempts: {attempts_str}")
+                print(f"📊 Candidate {i+1} Summary: {attempts_str}")
                 
-                # Penalty for obviously wrong text (phone numbers, etc.)
-                if len(extracted_text) > 10 or any(char in extracted_text for char in ['@', '#', '$', '%']):
-                    ocr_confidence *= 0.1
+                # Group attempts by confidence range (within 0.1 of each other)
+                confidence_groups = {}
+                for attempt in all_attempts:
+                    conf_key = round(attempt['confidence'], 1)  # Round to nearest 0.1
+                    if conf_key not in confidence_groups:
+                        confidence_groups[conf_key] = []
+                    confidence_groups[conf_key].append(attempt)
+                
+                # Find the highest confidence group
+                max_conf_key = max(confidence_groups.keys()) if confidence_groups else 0
+                top_group = confidence_groups.get(max_conf_key, [])
+                
+                # Apply majority voting within the top confidence group
+                if len(top_group) > 1:
+                    print(f"🗳️  Majority voting among {len(top_group)} similar-confidence results:")
+                    
+                    # Count occurrences of each text result
+                    text_votes = {}
+                    for attempt in top_group:
+                        text = attempt['text']
+                        if text not in text_votes:
+                            text_votes[text] = {'count': 0, 'total_conf': 0, 'attempts': []}
+                        text_votes[text]['count'] += 1
+                        text_votes[text]['total_conf'] += attempt['confidence']
+                        text_votes[text]['attempts'].append(attempt)
+                    
+                    # Find majority winner
+                    max_votes = max(text_votes[text]['count'] for text in text_votes)
+                    majority_candidates = [text for text in text_votes if text_votes[text]['count'] == max_votes]
+                    
+                    for text, data in text_votes.items():
+                        avg_conf = data['total_conf'] / data['count']
+                        print(f"   '{text}': {data['count']} votes (avg conf: {avg_conf:.3f})")
+                    
+                    if len(majority_candidates) == 1:
+                        # Clear majority winner
+                        majority_text = majority_candidates[0]
+                        majority_data = text_votes[majority_text]
+                        best_text = majority_text
+                        best_confidence = majority_data['total_conf'] / majority_data['count']
+                        best_phase = majority_data['attempts'][0]['phase']
+                        print(f"   🏆 Majority winner: '{best_text}' ({majority_data['count']} votes)")
+                    
+                    elif len(majority_candidates) > 1:
+                        # Tie-breaker: prefer longer text (more complete detection)
+                        longest_text = max(majority_candidates, key=len)
+                        majority_data = text_votes[longest_text]
+                        best_text = longest_text
+                        best_confidence = majority_data['total_conf'] / majority_data['count']
+                        best_phase = majority_data['attempts'][0]['phase']
+                        print(f"   🎯 Tie-breaker: choosing longer text '{best_text}'")
+                
+                logger.info(f"Best result: '{best_text}' from {best_phase} (conf={best_confidence:.3f})")
+                print(f"🏆 Final: '{best_text}' from {best_phase} (conf={best_confidence:.3f})")
+            else:
+                logger.warning(f"No OCR results for candidate {i+1}")
+                print(f"❌ Candidate {i+1}: No OCR results")
+            
+            # Calculate final OCR confidence
+            ocr_confidence = best_confidence
+            
+            # Penalty for obviously wrong text
+            if best_text and (len(best_text) > 10 or any(char in best_text for char in ['@', '#', '$', '%'])):
+                ocr_confidence *= 0.1
             
             # Boost area score based on OCR success
             boosted_area = area
-            if is_valid:
-                boosted_area *= (1.0 + ocr_confidence * 2.0)  # Strong boost for valid plates
-            elif extracted_text and len(extracted_text) >= 3:
-                boosted_area *= (1.0 + ocr_confidence * 0.5)  # Small boost for readable text
-            else:
-                boosted_area *= 0.5  # Penalty for no readable text
+            is_valid = any(a['is_valid'] for a in all_attempts)
             
-            verified_candidates.append((x, y, w, h, boosted_area, extracted_text, ocr_confidence))
+            if is_valid and best_text:
+                # MASSIVE boost to ensure valid plates become Candidate 1
+                boosted_area *= (1.0 + ocr_confidence * 50.0)  # INCREASED from 3.0 to 50.0
+                print(f"   🎯 VALID PLATE BOOST: '{best_text}' gets 50x confidence multiplier!")
+            elif best_text and len(best_text) >= 3:
+                boosted_area *= (1.0 + ocr_confidence * 5.0)  # INCREASED from 1.0 to 5.0
+                print(f"   📝 READABLE TEXT BOOST: '{best_text}' gets 5x confidence multiplier")
+            else:
+                boosted_area *= 0.1  # INCREASED penalty to push non-readable candidates down
+                print(f"   ❌ NO TEXT PENALTY: Candidate gets 0.1x multiplier")
+            
+            verified_candidates.append((x, y, w, h, boosted_area, best_text, ocr_confidence))
             
         except Exception as e:
             logger.warning(f"OCR verification failed for candidate {i}: {e}")
             verified_candidates.append((x, y, w, h, area * 0.3, "", 0.0))  # Penalty for OCR failure
     
-    # Sort by boosted area score
-    verified_candidates.sort(key=lambda x: x[4], reverse=True)
-    return verified_candidates
+    # GUARANTEE: Valid license plates always come first
+    valid_plates = []
+    other_candidates = []
+    
+    for candidate in verified_candidates:
+        x, y, w, h, boosted_area, text, confidence = candidate
+        
+        # Check if this candidate has a valid Malaysian plate text
+        if text:
+            is_valid, _, _ = validate_malaysian_plate_format(text)
+            if is_valid:
+                valid_plates.append(candidate)
+                print(f"✅ GUARANTEED #1: Valid plate '{text}' will be Candidate 1")
+            else:
+                other_candidates.append(candidate)
+        else:
+            other_candidates.append(candidate)
+    
+    # Sort each group by boosted area score
+    valid_plates.sort(key=lambda x: x[4], reverse=True)
+    other_candidates.sort(key=lambda x: x[4], reverse=True)
+    
+    # Combine: valid plates first, then others
+    final_candidates = valid_plates + other_candidates
+    
+    print(f"🏆 FINAL RANKING: {len(valid_plates)} valid plates first, then {len(other_candidates)} other candidates")
+    
+    return final_candidates
 
 # ============================================================================
 # IMAGE ENHANCEMENT AND PROCESSING
@@ -848,22 +1027,60 @@ def enhance_plate_region(image: np.ndarray, x: int, y: int, w: int, h: int) -> n
     # Start with a copy of the ROI
     enhanced_roi = roi.copy()
     
-    # Basic enhancement: Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    # SMART enhancement: Different approaches based on region size
     try:
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        enhanced_roi = clahe.apply(enhanced_roi)
+        region_area = enhanced_roi.shape[0] * enhanced_roi.shape[1]
+        print(f"🔧 Enhancing region: {enhanced_roi.shape[1]}x{enhanced_roi.shape[0]} (area={region_area})")
         
-        # Apply bilateral filtering for noise reduction
-        if enhanced_roi.shape[0] >= 5 and enhanced_roi.shape[1] >= 5:
-            enhanced_roi = cv2.bilateralFilter(enhanced_roi, 5, 50, 50)
-        
-        # Simple contrast stretching
-        min_val, max_val = np.min(enhanced_roi), np.max(enhanced_roi)
-        if max_val > min_val:
-            enhanced_roi = ((enhanced_roi - min_val) * 255.0 / (max_val - min_val)).astype(np.uint8)
+        # MOTORCYCLE-SPECIFIC: For small regions (likely motorcycles), use different approach
+        if region_area < 3000:  # Small motorcycle plate region
+            print(f"   📱 Small region detected - using motorcycle enhancement")
+            
+            # For small regions, upscale first to help OCR
+            scale_factor = max(2, int(60 / min(enhanced_roi.shape[:2])))  # Scale to at least 60px height
+            if scale_factor > 1:
+                enhanced_roi = cv2.resize(enhanced_roi, 
+                                        (enhanced_roi.shape[1] * scale_factor, 
+                                         enhanced_roi.shape[0] * scale_factor), 
+                                        interpolation=cv2.INTER_CUBIC)
+                print(f"   📈 Upscaled by {scale_factor}x to {enhanced_roi.shape[1]}x{enhanced_roi.shape[0]}")
+            
+            # More aggressive contrast enhancement for small text
+            min_val, max_val = np.min(enhanced_roi), np.max(enhanced_roi)
+            contrast_range = max_val - min_val
+            
+            if contrast_range < 150 and contrast_range > 0:  # More aggressive threshold for small plates
+                enhanced_roi = ((enhanced_roi - min_val) * 255.0 / contrast_range).astype(np.uint8)
+                print(f"   🎨 Applied aggressive contrast: {min_val}-{max_val} -> 0-255")
+            
+            # Light denoising for upscaled small images
+            enhanced_roi = cv2.medianBlur(enhanced_roi, 3)
+            print(f"   🧹 Applied denoising")
+            
+        else:  # Larger regions (likely cars) - use gentle enhancement
+            print(f"   🚗 Large region detected - using gentle enhancement")
+            
+            # Method 1: Simple histogram stretching (very gentle)
+            min_val, max_val = np.min(enhanced_roi), np.max(enhanced_roi)
+            contrast_range = max_val - min_val
+            
+            # Only enhance if contrast is very poor (< 100 out of 255)
+            if contrast_range < 100 and contrast_range > 0:
+                enhanced_roi = ((enhanced_roi - min_val) * 255.0 / contrast_range).astype(np.uint8)
+                print(f"   🎨 Applied gentle contrast enhancement: {min_val}-{max_val} -> 0-255")
+            else:
+                print(f"   ✅ Skipped enhancement - good contrast: {contrast_range}")
+            
+            # Method 2: Very light sharpening only for larger regions
+            if enhanced_roi.shape[0] > 30 and enhanced_roi.shape[1] > 60:
+                # Gentle unsharp mask
+                gaussian = cv2.GaussianBlur(enhanced_roi, (3, 3), 1.0)
+                enhanced_roi = cv2.addWeighted(enhanced_roi, 1.2, gaussian, -0.2, 0)
+                print(f"   ✨ Applied gentle sharpening")
         
     except Exception as e:
-        logger.warning(f"Enhancement failed, using original ROI: {e}")
+        logger.warning(f"Enhancement failed, using raw ROI: {e}")
+        print(f"   ❌ Enhancement failed: {e}")
         enhanced_roi = roi.copy()
     
     return enhanced_roi
@@ -1008,36 +1225,48 @@ def process_image_through_phases(img_np: np.ndarray) -> Tuple[Dict[str, np.ndarr
         if center_y > img_height * 0.7:  # Bottom 30% of image
             position_score = 1.5  # Still good but slightly lower
         
-        # Prefer reasonable license plate sizes (not too huge)
+        # IMPROVED size scoring with motorcycle support
         size_score = 1.0
         if area > 25000:  # Very large areas are likely false positives
             size_score = 0.2
         elif area > 15000:  # Large areas are suspicious
             size_score = 0.4
-        elif 5000 <= area <= 15000:  # Good size range for license plates
+        elif 5000 <= area <= 15000:  # Good size range for car license plates
             size_score = 1.5
-        elif 2000 <= area <= 5000:  # Smaller plates (like AAT40)
+        elif 2000 <= area <= 5000:  # Smaller plates (cars and large motorcycles)
             size_score = 1.8  # Higher bonus for smaller realistic plates
-        elif 1000 <= area <= 2000:  # Very small but possible
-            size_score = 1.2
+        elif 800 <= area <= 2000:  # MOTORCYCLE SIZE RANGE - high priority
+            size_score = 2.0   # INCREASED bonus for motorcycle-sized plates
+        elif 400 <= area <= 800:   # Very small motorcycles - still valid
+            size_score = 1.5   # Good bonus for very small plates
+        elif 200 <= area <= 400:   # Tiny but possible
+            size_score = 1.0
+        else:
+            size_score = 0.3   # Very small or very large
         
-        # Aspect ratio preference
+        # IMPROVED aspect ratio preference with motorcycle support
         aspect_ratio = w / h
         aspect_score = 1.0
-        if 3.0 <= aspect_ratio <= 4.5:  # Ideal single-line license plate aspect ratio
+        if 3.0 <= aspect_ratio <= 4.5:  # Ideal single-line car plates
             aspect_score = 1.2
-        elif 1.0 <= aspect_ratio <= 2.0:  # Ideal 2-line license plate aspect ratio
-            aspect_score = 1.3  # Slightly higher bonus for 2-line plates
+        elif 1.4 <= aspect_ratio <= 2.2:  # MOTORCYCLE ASPECT RATIO - high priority
+            aspect_score = 1.5  # INCREASED bonus for motorcycle aspect ratios
+        elif 1.0 <= aspect_ratio <= 1.4:  # Square 2-line plates
+            aspect_score = 1.3  # Good bonus for square 2-line plates
+        elif 2.2 <= aspect_ratio <= 3.0:  # Between motorcycle and car
+            aspect_score = 1.1
+        elif 0.7 <= aspect_ratio <= 1.0:  # Very square 2-line plates
+            aspect_score = 1.2  # Increased for very square motorcycle plates
         elif 2.0 <= aspect_ratio <= 5.0:  # Acceptable range
             aspect_score = 1.0
-        elif 0.8 <= aspect_ratio <= 1.0:  # Very square 2-line plates
-            aspect_score = 1.1
         else:
             aspect_score = 0.8
         
-        # Method-specific bonuses with improved scoring
+        # Method-specific bonuses with MOTORCYCLE PRIORITY
         method_score = 1.0
-        if method == "2line":  # Two-line plate detection gets very high priority
+        if method == "motorcycle":  # NEW: Motorcycle-specific detection gets highest priority
+            method_score = 4.0
+        elif method == "2line":  # Two-line plate detection gets very high priority  
             method_score = 3.5
         elif method == "bus":  # Bus-specific detection gets high priority
             method_score = 3.0
@@ -1307,8 +1536,8 @@ with tab1:
                         best_candidate = None
                         
                         if plate_candidates and ocr_model:
-                            # Run OCR verification on top candidates
-                            verified_candidates = ocr_verification_pipeline(ocr_model, ocr_engine, plate_candidates, phases['restored'])
+                            # Run OCR verification on top candidates using multiple phases
+                            verified_candidates = ocr_verification_pipeline(ocr_model, ocr_engine, plate_candidates, phases)
                             
                             if verified_candidates:
                                 # Get the best verified candidate
