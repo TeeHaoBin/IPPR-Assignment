@@ -66,7 +66,6 @@ def load_ocr_model():
         return ocr_model, "paddleocr"
     except Exception as e:
         st.warning(f"⚠️ PaddleOCR failed to load: {str(e)}")
-        logger.error(f"PaddleOCR loading failed: {e}")
         return None, None
 
 # ============================================================================
@@ -238,22 +237,24 @@ def find_plate_candidates_from_binary(binary_image: np.ndarray, original_image: 
         aspect_ratio = w / float(h)
         area_ratio = (w * h) / img_area
         
-        # 1. IMPROVED aspect ratio check (better motorcycle support)
-        valid_single_line = 2.0 <= aspect_ratio <= 5.5  # Standard car plates
-        valid_two_line = 1.0 <= aspect_ratio <= 2.8      # 2-line plates like WSL/2956  
-        valid_square_2line = 0.7 <= aspect_ratio <= 1.3  # Square motorcycle plates
-        valid_motorcycle = 1.3 <= aspect_ratio <= 2.2    # Typical motorcycle range
-        valid_aspect = valid_single_line or valid_two_line or valid_square_2line or valid_motorcycle
+        # 1. FIXED: Much more lenient aspect ratio check (includes ALL valid plates)
+        valid_single_line = 1.8 <= aspect_ratio <= 6.0    # Standard car plates (EXPANDED)
+        valid_two_line = 0.7 <= aspect_ratio <= 3.0       # 2-line plates (EXPANDED)
+        valid_square_2line = 0.5 <= aspect_ratio <= 1.5   # Square plates (EXPANDED)
+        valid_motorcycle = 1.0 <= aspect_ratio <= 2.8     # Motorcycles (EXPANDED)
+        valid_wide_plates = 2.8 <= aspect_ratio <= 4.0    # Wide plates (EXPANDED)
+        valid_very_wide = 4.0 <= aspect_ratio <= 7.0      # Very wide plates (NEW)
+        valid_aspect = valid_single_line or valid_two_line or valid_square_2line or valid_motorcycle or valid_wide_plates or valid_very_wide
         
-        # 2. RELAXED size check (better for small motorcycle plates)
-        valid_size = 0.0003 <= area_ratio <= 0.10  # LOWERED minimum from 0.0005 to 0.0003
+        # 2. FIXED: Balanced size check (works for both cars and motorcycles)  
+        valid_size = 0.00001 <= area_ratio <= 0.20  # VERY LENIENT for all plate types
         
-        # 3. LOWERED minimum dimensions for motorcycles
-        valid_dimensions = w > 30 and h > 15  # REDUCED from w>40, h>20
+        # 3. FIXED: More reasonable minimum dimensions (not too restrictive)
+        valid_dimensions = w > 12 and h > 4  # REDUCED further to catch more plates
         
-        # 4. Maximum dimensions (prevent huge false positives)
-        max_w = binary_image.shape[1] * 0.6  # Max 60% of image width
-        max_h = binary_image.shape[0] * 0.4  # Max 40% of image height
+        # 4. FIXED: More lenient maximum dimensions 
+        max_w = binary_image.shape[1] * 0.8  # Max 80% of image width (INCREASED)
+        max_h = binary_image.shape[0] * 0.6  # Max 60% of image height (INCREASED)
         valid_max_dimensions = w <= max_w and h <= max_h
         
         if not (valid_aspect and valid_size and valid_dimensions and valid_max_dimensions):
@@ -275,11 +276,11 @@ def find_plate_candidates_from_binary(binary_image: np.ndarray, original_image: 
         epsilon = 0.02 * perimeter
         approx = cv2.approxPolyDP(contour, epsilon, True)
         
-        # Filter for license plate shape characteristics
-        is_rectangular = len(approx) >= 4 and len(approx) <= 8  # Roughly rectangular
-        good_circularity = 0.1 <= circularity <= 0.9  # Not too circular, not too irregular
-        good_extent = extent > 0.3  # Relaxed from 0.4 for 2-line plates
-        good_solidity = solidity > 0.6  # Relaxed from 0.65 for 2-line plates
+        # Filter for license plate shape characteristics (FIXED: More lenient)
+        is_rectangular = len(approx) >= 3 and len(approx) <= 12  # VERY flexible for all plate types
+        good_circularity = 0.02 <= circularity <= 0.98  # VERY RELAXED for all detections
+        good_extent = extent > 0.20  # VERY RELAXED for all plate types
+        good_solidity = solidity > 0.4   # VERY RELAXED for all conditions
         
         if not (good_extent and good_solidity and is_rectangular and good_circularity):
             continue
@@ -489,33 +490,206 @@ def detect_license_plate_regions(image: np.ndarray) -> List[Tuple[int, int, int,
     except:
         pass
     
-    # Method 8: MOTORCYCLE-SPECIFIC detection (small, square plates)
+    # Method 8: ENHANCED MOTORCYCLE-SPECIFIC detection (small, square plates)
     try:
         # Use smaller, more aggressive thresholding for small motorcycle plates
-        motorcycle_thresh = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 4)
+        motorcycle_thresh = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 9, 3)
         
-        # Motorcycle plates are typically smaller and more square
-        # Use smaller morphological kernels suited for motorcycle text size
-        kernel_moto_h = cv2.getStructuringElement(cv2.MORPH_RECT, (6, 2))  # Smaller horizontal connection
-        kernel_moto_v = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 6))  # Smaller vertical connection
+        # STAGE 1: Micro-motorcycles (very small distant plates)
+        # Use tiny morphological kernels for very small text
+        kernel_micro_h = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))  # Tiny horizontal connection
+        kernel_micro_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 4))  # Tiny vertical connection
         
-        # Process for horizontal text connection first
+        micro_processed = cv2.morphologyEx(motorcycle_thresh, cv2.MORPH_CLOSE, kernel_micro_h)
+        micro_processed = cv2.morphologyEx(micro_processed, cv2.MORPH_CLOSE, kernel_micro_v)
+        
+        # Very light final connection
+        kernel_micro_final = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 5))
+        micro_processed = cv2.morphologyEx(micro_processed, cv2.MORPH_CLOSE, kernel_micro_final)
+        
+        candidates_micro = find_plate_candidates_from_binary(micro_processed, image)
+        all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "micro_motorcycle") for c in candidates_micro])
+        
+        # STAGE 2: Regular motorcycles (standard size)
+        # Use slightly larger kernels for normal motorcycle plates
+        kernel_moto_h = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 2))  # Small horizontal connection
+        kernel_moto_v = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 5))  # Small vertical connection
+        
         moto_processed = cv2.morphologyEx(motorcycle_thresh, cv2.MORPH_CLOSE, kernel_moto_h)
-        
-        # Then vertical connection for two-line format
         moto_processed = cv2.morphologyEx(moto_processed, cv2.MORPH_CLOSE, kernel_moto_v)
         
-        # Final connection with medium kernel
-        kernel_final = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 8))
+        # Final connection with small kernel
+        kernel_final = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 6))
         moto_processed = cv2.morphologyEx(moto_processed, cv2.MORPH_CLOSE, kernel_final)
         
-        # Light cleanup to remove small noise but preserve small plates
-        kernel_cleanup = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        # Very light cleanup to preserve small plates
+        kernel_cleanup = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         moto_processed = cv2.morphologyEx(moto_processed, cv2.MORPH_OPEN, kernel_cleanup)
         
         candidates_motorcycle = find_plate_candidates_from_binary(moto_processed, image)
         all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], "motorcycle") for c in candidates_motorcycle])
+        
     except:
+        pass
+    
+    # Method 9: MULTI-SCALE MOTORCYCLE detection (handles various distances)
+    try:
+        # Create multiple scales to handle plates at different distances
+        h_img, w_img = image.shape[:2]
+        
+        # Scale 1: Original size for close motorcycles
+        scale1_thresh = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 7, 2)
+        
+        # Use progressive kernels for different text sizes
+        for kernel_size in [(2, 1), (3, 2), (4, 3)]:  # Very small kernels
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
+            processed = cv2.morphologyEx(scale1_thresh, cv2.MORPH_CLOSE, kernel)
+            
+            # Add vertical connection for 2-line plates
+            kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_size[1] + 2))
+            processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel_v)
+            
+            candidates_scale = find_plate_candidates_from_binary(processed, image)
+            all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], f"multiscale_{kernel_size[0]}x{kernel_size[1]}") for c in candidates_scale])
+            
+        # Scale 2: Handle very small distant plates with upscaling
+        if min(h_img, w_img) > 200:  # Only if image is large enough
+            # Create a focused region for distant plate detection (lower 2/3 of image)
+            roi_y_start = h_img // 3
+            roi = image[roi_y_start:, :]
+            
+            # Apply more aggressive thresholding for distant small plates
+            distant_thresh = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 5, 1)
+            
+            # Use the smallest possible kernels for distant plates
+            kernel_tiny = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+            distant_processed = cv2.morphologyEx(distant_thresh, cv2.MORPH_CLOSE, kernel_tiny)
+            
+            # Add minimal vertical connection
+            kernel_tiny_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+            distant_processed = cv2.morphologyEx(distant_processed, cv2.MORPH_CLOSE, kernel_tiny_v)
+            
+            # Find candidates in ROI and adjust coordinates
+            roi_candidates = find_plate_candidates_from_binary(distant_processed, roi)
+            for x, y, w, h, area in roi_candidates:
+                adjusted_y = y + roi_y_start  # Adjust for ROI offset
+                all_candidates.append((x, adjusted_y, w, h, area, "distant_motorcycle"))
+                
+    except:
+        pass
+    
+    # Method 10: EXTREME CASES detection (for very challenging motorcycle plates)
+    try:
+        
+        # CASE 1: Ultra-small distant plates (like KAA17)
+        # Use minimal thresholding to catch faint distant plates
+        _, ultra_thresh = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Ultra-minimal morphological operations
+        kernel_ultra = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))  # Minimal kernel
+        ultra_processed = cv2.morphologyEx(ultra_thresh, cv2.MORPH_CLOSE, kernel_ultra)
+        
+        # Try to connect very small text pieces with tiny kernels
+        for tiny_size in [(2, 1), (1, 2), (3, 1), (1, 3)]:
+            tiny_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, tiny_size)
+            temp_processed = cv2.morphologyEx(ultra_processed, cv2.MORPH_CLOSE, tiny_kernel)
+            
+            candidates_ultra = find_plate_candidates_from_binary(temp_processed, image)
+            all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], f"ultra_tiny_{tiny_size[0]}x{tiny_size[1]}") for c in candidates_ultra])
+        
+        # CASE 2: Dark/low-light plates (like GT41)
+        # Enhanced histogram equalization for dark images
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4,4))
+        enhanced_dark = clahe.apply(image)
+        
+        # Apply multiple thresholding approaches for dark images
+        dark_methods = [
+            (cv2.THRESH_BINARY, "dark_binary"),
+            (cv2.THRESH_BINARY_INV, "dark_binary_inv"), 
+            (cv2.ADAPTIVE_THRESH_GAUSSIAN_C, "dark_adaptive_gauss"),
+            (cv2.ADAPTIVE_THRESH_MEAN_C, "dark_adaptive_mean")
+        ]
+        
+        for thresh_type, method_name in dark_methods:
+            try:
+                if thresh_type in [cv2.THRESH_BINARY, cv2.THRESH_BINARY_INV]:
+                    _, dark_thresh = cv2.threshold(enhanced_dark, 0, 255, thresh_type + cv2.THRESH_OTSU)
+                else:
+                    dark_thresh = cv2.adaptiveThreshold(enhanced_dark, 255, thresh_type, cv2.THRESH_BINARY, 3, 1)
+                
+                # Very light morphology for dark images
+                kernel_dark = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+                dark_processed = cv2.morphologyEx(dark_thresh, cv2.MORPH_CLOSE, kernel_dark)
+                
+                candidates_dark = find_plate_candidates_from_binary(dark_processed, image)
+                all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], method_name) for c in candidates_dark])
+            except:
+                continue
+        
+        # CASE 3: Heavily occluded plates (like MBQ73)
+        # Use very permissive shape filtering
+        # Apply gentle gaussian blur to connect fragmented text
+        blurred = cv2.GaussianBlur(image, (3, 3), 1.0)
+        _, occluded_thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Try different dilation strategies to connect broken text
+        for dilation_size in [(1, 2), (2, 1), (2, 2), (3, 2), (2, 3)]:
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, dilation_size)
+            occluded_processed = cv2.dilate(occluded_thresh, kernel_dilate, iterations=1)
+            
+            # Very light erosion to clean up
+            kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+            occluded_processed = cv2.erode(occluded_processed, kernel_erode, iterations=1)
+            
+            candidates_occluded = find_plate_candidates_from_binary(occluded_processed, image)
+            all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], f"occluded_{dilation_size[0]}x{dilation_size[1]}") for c in candidates_occluded])
+        
+        # CASE 4: Two-line plates with rider interference (like BNW76)
+        # Focus on vertical text connection with rider masking
+        
+        # Create a mask to reduce rider interference (focus on lower portion)
+        h_img, w_img = image.shape
+        mask = np.zeros_like(image)
+        # Focus on bottom 60% where license plates typically are, avoiding rider torso
+        mask[int(h_img * 0.4):, int(w_img * 0.1):int(w_img * 0.9)] = 255
+        
+        masked_image = cv2.bitwise_and(image, mask)
+        
+        # Apply aggressive adaptive thresholding on masked region
+        masked_thresh = cv2.adaptiveThreshold(masked_image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 7, 2)
+        
+        # Specialized 2-line connection with various vertical kernels
+        for v_height in range(3, 12, 2):  # Try different vertical connection heights
+            kernel_2line = cv2.getStructuringElement(cv2.MORPH_RECT, (2, v_height))
+            two_line_processed = cv2.morphologyEx(masked_thresh, cv2.MORPH_CLOSE, kernel_2line)
+            
+            # Add horizontal connection within each line
+            kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 1))
+            two_line_processed = cv2.morphologyEx(two_line_processed, cv2.MORPH_CLOSE, kernel_h)
+            
+            candidates_2line_special = find_plate_candidates_from_binary(two_line_processed, image)
+            all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], f"special_2line_v{v_height}") for c in candidates_2line_special])
+        
+        # CASE 5: Indoor/artificial lighting plates (like WCQ7)
+        # Enhanced gamma correction for indoor lighting
+        for gamma in [0.5, 0.7, 1.3, 1.5]:  # Different gamma values
+            gamma_corrected = np.array(255 * (image / 255) ** gamma, dtype='uint8')
+            
+            # Apply strong adaptive thresholding
+            indoor_thresh = cv2.adaptiveThreshold(gamma_corrected, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 5, 1)
+            
+            # Minimal morphology to preserve small text
+            kernel_indoor = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+            indoor_processed = cv2.morphologyEx(indoor_thresh, cv2.MORPH_CLOSE, kernel_indoor)
+            
+            # Add tiny vertical connection for 2-line indoor plates
+            kernel_indoor_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+            indoor_processed = cv2.morphologyEx(indoor_processed, cv2.MORPH_CLOSE, kernel_indoor_v)
+            
+            candidates_indoor = find_plate_candidates_from_binary(indoor_processed, image)
+            all_candidates.extend([(c[0], c[1], c[2], c[3], c[4], f"indoor_gamma_{gamma}") for c in candidates_indoor])
+            
+    except Exception as e:
         pass
     
     # Remove duplicates (similar positions)
@@ -666,12 +840,10 @@ def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional
             # Standard PaddleOCR format: list of list of [bbox, (text, confidence)]
             if results[0] is not None:
                 texts_and_scores = []
-                print(f"🔍 Raw OCR found {len(results[0])} detections:")
                 for i, detection in enumerate(results[0], 1):
                     if len(detection) >= 2:
                         text, confidence = detection[1]
                         texts_and_scores.append((text, confidence))
-                        print(f"  {i}. '{text}' (raw confidence: {confidence:.4f})")
                 
                 if texts_and_scores:
                     # Sort by confidence to get reliable texts first
@@ -681,17 +853,11 @@ def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional
                     for text, score in texts_and_scores:
                         clean_text = re.sub(r'[^A-Z0-9]', '', text.strip().upper())
                         if len(clean_text) >= 4 and score > 0.6:  # LOWERED: More lenient for single plates
-                            print(f"🎯 Single plate candidate: '{clean_text}' (score={score:.3f})")
-                            
                             # VALIDATE FORMAT before accepting single plate
                             is_valid, format_conf, format_type = validate_malaysian_plate_format(clean_text)
-                            print(f"   Format validation: valid={is_valid}, conf={format_conf:.3f}, type={format_type}")
                             
                             if is_valid:
-                                print(f"   ✅ Single plate accepted: '{clean_text}'")
                                 return clean_text
-                            else:
-                                print(f"   ❌ Single plate rejected: invalid format - will try 2-line processing")
                     
                     # ENHANCED 2-LINE PROCESSING: Better line detection and combination
                     if len(texts_and_scores) >= 2:
@@ -785,7 +951,6 @@ def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional
         return None
             
     except Exception as e:
-        logger.error(f"OCR Error: {str(e)}")
         st.error(f"OCR Error: {str(e)}")
         return None
 
@@ -803,8 +968,8 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
         ("color_processed", "Phase 4: HSV Value channel")
     ]
     
-    # Process top candidates (limit to save processing time)
-    for i, (x, y, w, h, area) in enumerate(candidates[:8]):
+    # Process top candidates (expanded to match UI display)
+    for i, (x, y, w, h, area) in enumerate(candidates[:10]):
         try:
             best_text = ""
             best_confidence = 0.0
@@ -844,8 +1009,6 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
                             'format_type': format_type
                         })
                         
-                        logger.info(f"Candidate {i+1} - {phase_name}: '{extracted_text}' (conf={attempt_confidence:.3f}, valid={is_valid})")
-                        print(f"🔍 Candidate {i+1} - {phase_name}: '{extracted_text}' (conf={attempt_confidence:.3f}, valid={is_valid})")
                         
                         # Update best result if this is better
                         if attempt_confidence > best_confidence:
@@ -854,14 +1017,11 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
                             best_phase = phase_name
                             
                 except Exception as phase_error:
-                    logger.warning(f"OCR failed on {phase_name} for candidate {i}: {phase_error}")
                     continue
             
             # MAJORITY VOTING: When scores are similar, use majority vote
             if all_attempts:
                 attempts_str = [(a['text'], f"{a['confidence']:.3f}") for a in all_attempts]
-                logger.info(f"Candidate {i+1} OCR attempts: {attempts_str}")
-                print(f"📊 Candidate {i+1} Summary: {attempts_str}")
                 
                 # Group attempts by confidence range (within 0.1 of each other)
                 confidence_groups = {}
@@ -877,8 +1037,6 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
                 
                 # Apply majority voting within the top confidence group
                 if len(top_group) > 1:
-                    print(f"🗳️  Majority voting among {len(top_group)} similar-confidence results:")
-                    
                     # Count occurrences of each text result
                     text_votes = {}
                     for attempt in top_group:
@@ -893,10 +1051,6 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
                     max_votes = max(text_votes[text]['count'] for text in text_votes)
                     majority_candidates = [text for text in text_votes if text_votes[text]['count'] == max_votes]
                     
-                    for text, data in text_votes.items():
-                        avg_conf = data['total_conf'] / data['count']
-                        print(f"   '{text}': {data['count']} votes (avg conf: {avg_conf:.3f})")
-                    
                     if len(majority_candidates) == 1:
                         # Clear majority winner
                         majority_text = majority_candidates[0]
@@ -904,7 +1058,6 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
                         best_text = majority_text
                         best_confidence = majority_data['total_conf'] / majority_data['count']
                         best_phase = majority_data['attempts'][0]['phase']
-                        print(f"   🏆 Majority winner: '{best_text}' ({majority_data['count']} votes)")
                     
                     elif len(majority_candidates) > 1:
                         # Tie-breaker: prefer longer text (more complete detection)
@@ -913,13 +1066,9 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
                         best_text = longest_text
                         best_confidence = majority_data['total_conf'] / majority_data['count']
                         best_phase = majority_data['attempts'][0]['phase']
-                        print(f"   🎯 Tie-breaker: choosing longer text '{best_text}'")
                 
-                logger.info(f"Best result: '{best_text}' from {best_phase} (conf={best_confidence:.3f})")
-                print(f"🏆 Final: '{best_text}' from {best_phase} (conf={best_confidence:.3f})")
             else:
-                logger.warning(f"No OCR results for candidate {i+1}")
-                print(f"❌ Candidate {i+1}: No OCR results")
+                pass
             
             # Calculate final OCR confidence
             ocr_confidence = best_confidence
@@ -935,18 +1084,14 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
             if is_valid and best_text:
                 # MASSIVE boost to ensure valid plates become Candidate 1
                 boosted_area *= (1.0 + ocr_confidence * 50.0)  # INCREASED from 3.0 to 50.0
-                print(f"   🎯 VALID PLATE BOOST: '{best_text}' gets 50x confidence multiplier!")
             elif best_text and len(best_text) >= 3:
                 boosted_area *= (1.0 + ocr_confidence * 5.0)  # INCREASED from 1.0 to 5.0
-                print(f"   📝 READABLE TEXT BOOST: '{best_text}' gets 5x confidence multiplier")
             else:
                 boosted_area *= 0.1  # INCREASED penalty to push non-readable candidates down
-                print(f"   ❌ NO TEXT PENALTY: Candidate gets 0.1x multiplier")
             
             verified_candidates.append((x, y, w, h, boosted_area, best_text, ocr_confidence))
             
         except Exception as e:
-            logger.warning(f"OCR verification failed for candidate {i}: {e}")
             verified_candidates.append((x, y, w, h, area * 0.3, "", 0.0))  # Penalty for OCR failure
     
     # GUARANTEE: Valid license plates always come first
@@ -961,7 +1106,6 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
             is_valid, _, _ = validate_malaysian_plate_format(text)
             if is_valid:
                 valid_plates.append(candidate)
-                print(f"✅ GUARANTEED #1: Valid plate '{text}' will be Candidate 1")
             else:
                 other_candidates.append(candidate)
         else:
@@ -973,8 +1117,6 @@ def ocr_verification_pipeline(ocr_model, ocr_engine: str, candidates: List, phas
     
     # Combine: valid plates first, then others
     final_candidates = valid_plates + other_candidates
-    
-    print(f"🏆 FINAL RANKING: {len(valid_plates)} valid plates first, then {len(other_candidates)} other candidates")
     
     return final_candidates
 
@@ -995,7 +1137,6 @@ def enhance_plate_region(image: np.ndarray, x: int, y: int, w: int, h: int) -> n
     """
     # Validate input coordinates
     if x < 0 or y < 0 or w <= 0 or h <= 0:
-        logger.warning(f"Invalid coordinates: x={x}, y={y}, w={w}, h={h}")
         return np.zeros((max(h, 50), max(w, 100)), dtype=np.uint8)
     
     # Extract region of interest with bounds checking
@@ -1017,7 +1158,6 @@ def enhance_plate_region(image: np.ndarray, x: int, y: int, w: int, h: int) -> n
     
     # Handle empty or invalid ROI
     if roi.size == 0 or roi.shape[0] == 0 or roi.shape[1] == 0:
-        logger.warning(f"Empty ROI extracted: roi.shape={roi.shape if roi.size > 0 else 'empty'}")
         # Return proportional fallback based on aspect ratio
         aspect_ratio = w / h if h > 0 else 2.0
         fallback_h = 50
@@ -1030,11 +1170,9 @@ def enhance_plate_region(image: np.ndarray, x: int, y: int, w: int, h: int) -> n
     # SMART enhancement: Different approaches based on region size
     try:
         region_area = enhanced_roi.shape[0] * enhanced_roi.shape[1]
-        print(f"🔧 Enhancing region: {enhanced_roi.shape[1]}x{enhanced_roi.shape[0]} (area={region_area})")
         
         # MOTORCYCLE-SPECIFIC: For small regions (likely motorcycles), use different approach
         if region_area < 3000:  # Small motorcycle plate region
-            print(f"   📱 Small region detected - using motorcycle enhancement")
             
             # For small regions, upscale first to help OCR
             scale_factor = max(2, int(60 / min(enhanced_roi.shape[:2])))  # Scale to at least 60px height
@@ -1043,7 +1181,6 @@ def enhance_plate_region(image: np.ndarray, x: int, y: int, w: int, h: int) -> n
                                         (enhanced_roi.shape[1] * scale_factor, 
                                          enhanced_roi.shape[0] * scale_factor), 
                                         interpolation=cv2.INTER_CUBIC)
-                print(f"   📈 Upscaled by {scale_factor}x to {enhanced_roi.shape[1]}x{enhanced_roi.shape[0]}")
             
             # More aggressive contrast enhancement for small text
             min_val, max_val = np.min(enhanced_roi), np.max(enhanced_roi)
@@ -1051,14 +1188,11 @@ def enhance_plate_region(image: np.ndarray, x: int, y: int, w: int, h: int) -> n
             
             if contrast_range < 150 and contrast_range > 0:  # More aggressive threshold for small plates
                 enhanced_roi = ((enhanced_roi - min_val) * 255.0 / contrast_range).astype(np.uint8)
-                print(f"   🎨 Applied aggressive contrast: {min_val}-{max_val} -> 0-255")
             
             # Light denoising for upscaled small images
             enhanced_roi = cv2.medianBlur(enhanced_roi, 3)
-            print(f"   🧹 Applied denoising")
             
         else:  # Larger regions (likely cars) - use gentle enhancement
-            print(f"   🚗 Large region detected - using gentle enhancement")
             
             # Method 1: Simple histogram stretching (very gentle)
             min_val, max_val = np.min(enhanced_roi), np.max(enhanced_roi)
@@ -1067,20 +1201,18 @@ def enhance_plate_region(image: np.ndarray, x: int, y: int, w: int, h: int) -> n
             # Only enhance if contrast is very poor (< 100 out of 255)
             if contrast_range < 100 and contrast_range > 0:
                 enhanced_roi = ((enhanced_roi - min_val) * 255.0 / contrast_range).astype(np.uint8)
-                print(f"   🎨 Applied gentle contrast enhancement: {min_val}-{max_val} -> 0-255")
+                pass
             else:
-                print(f"   ✅ Skipped enhancement - good contrast: {contrast_range}")
+                pass
             
             # Method 2: Very light sharpening only for larger regions
             if enhanced_roi.shape[0] > 30 and enhanced_roi.shape[1] > 60:
                 # Gentle unsharp mask
                 gaussian = cv2.GaussianBlur(enhanced_roi, (3, 3), 1.0)
                 enhanced_roi = cv2.addWeighted(enhanced_roi, 1.2, gaussian, -0.2, 0)
-                print(f"   ✨ Applied gentle sharpening")
         
     except Exception as e:
-        logger.warning(f"Enhancement failed, using raw ROI: {e}")
-        print(f"   ❌ Enhancement failed: {e}")
+        pass
         enhanced_roi = roi.copy()
     
     return enhanced_roi
@@ -1209,13 +1341,21 @@ def process_image_through_phases(img_np: np.ndarray) -> Tuple[Dict[str, np.ndarr
         # Base score from area
         area_score = area
         
-        # Extreme penalty for being at image edges (likely false detections)
+        # Smart edge penalty (less harsh for small motorcycle plates)
         edge_penalty = 1.0
-        if (y <= 5 or x <= 5 or  # Very close to edges
-            (y + h) >= (img_height - 5) or (x + w) >= (img_width - 5) or  # Near opposite edges
-            y < 30 or x < 30 or  # Regular edge detection
-            (y + h) > (img_height - 30) or (x + w) > (img_width - 30)):  # Regular far edges
-            edge_penalty = 0.001  # Even more extreme penalty (99.9% reduction)
+        
+        # Check if this is likely a small motorcycle plate (area-based detection)
+        is_small_plate = area < 1000  # Likely motorcycle if area < 1000
+        
+        if (y <= 2 or x <= 2 or  # Only penalize VERY close to edges
+            (y + h) >= (img_height - 2) or (x + w) >= (img_width - 2)):  # Near opposite edges
+            edge_penalty = 0.001  # Extreme penalty for image border detections
+        elif not is_small_plate and (y < 20 or x < 20 or  # Regular edge penalty only for large plates
+            (y + h) > (img_height - 20) or (x + w) > (img_width - 20)):  # Regular far edges
+            edge_penalty = 0.1  # Moderate penalty for large plates near edges
+        elif is_small_plate and (y < 10 or x < 10 or  # More lenient for small plates
+            (y + h) > (img_height - 10) or (x + w) > (img_width - 10)):  # More lenient for small plates
+            edge_penalty = 0.5  # Light penalty for small plates near edges
         
         # Prefer license plates in lower 2/3 of image (where cars are)
         position_score = 1.0
@@ -1225,7 +1365,7 @@ def process_image_through_phases(img_np: np.ndarray) -> Tuple[Dict[str, np.ndarr
         if center_y > img_height * 0.7:  # Bottom 30% of image
             position_score = 1.5  # Still good but slightly lower
         
-        # IMPROVED size scoring with motorcycle support
+        # MOTORCYCLE-OPTIMIZED size scoring (prioritizes small plates)
         size_score = 1.0
         if area > 25000:  # Very large areas are likely false positives
             size_score = 0.2
@@ -1235,12 +1375,16 @@ def process_image_through_phases(img_np: np.ndarray) -> Tuple[Dict[str, np.ndarr
             size_score = 1.5
         elif 2000 <= area <= 5000:  # Smaller plates (cars and large motorcycles)
             size_score = 1.8  # Higher bonus for smaller realistic plates
-        elif 800 <= area <= 2000:  # MOTORCYCLE SIZE RANGE - high priority
-            size_score = 2.0   # INCREASED bonus for motorcycle-sized plates
-        elif 400 <= area <= 800:   # Very small motorcycles - still valid
-            size_score = 1.5   # Good bonus for very small plates
-        elif 200 <= area <= 400:   # Tiny but possible
-            size_score = 1.0
+        elif 800 <= area <= 2000:  # MOTORCYCLE SIZE RANGE - very high priority
+            size_score = 2.5   # INCREASED bonus for motorcycle-sized plates
+        elif 400 <= area <= 800:   # Small motorcycles - very high priority
+            size_score = 2.8   # HIGHEST bonus for small plates
+        elif 200 <= area <= 400:   # Tiny distant motorcycles - high priority
+            size_score = 2.2   # HIGH bonus for tiny plates
+        elif 100 <= area <= 200:   # Micro distant motorcycles - still valid
+            size_score = 1.8   # Good bonus for micro plates
+        elif 50 <= area <= 100:    # Very tiny but possible distant plates
+            size_score = 1.2   # Modest bonus
         else:
             size_score = 0.3   # Very small or very large
         
@@ -1262,21 +1406,43 @@ def process_image_through_phases(img_np: np.ndarray) -> Tuple[Dict[str, np.ndarr
         else:
             aspect_score = 0.8
         
-        # Method-specific bonuses with MOTORCYCLE PRIORITY
+        # Method-specific bonuses with EXTREME MOTORCYCLE PRIORITY
         method_score = 1.0
-        if method == "motorcycle":  # NEW: Motorcycle-specific detection gets highest priority
-            method_score = 4.0
-        elif method == "2line":  # Two-line plate detection gets very high priority  
-            method_score = 3.5
-        elif method == "bus":  # Bus-specific detection gets high priority
+        
+        # EXTREME CASES - HIGHEST PRIORITY
+        if method.startswith("ultra_tiny_"):  # ULTRA HIGH: Ultra-tiny distant plate detection
+            method_score = 15.0
+        elif method.startswith("indoor_gamma_"):  # ULTRA HIGH: Indoor lighting detection
+            method_score = 12.0
+        elif method.startswith("special_2line_"):  # ULTRA HIGH: Special 2-line with rider masking
+            method_score = 11.0
+        elif method.startswith("occluded_"):  # VERY HIGH: Occluded plate detection
+            method_score = 10.0
+        elif method.startswith("dark_"):  # VERY HIGH: Dark lighting detection
+            method_score = 9.5
+        
+        # STANDARD MOTORCYCLE DETECTION
+        elif method == "micro_motorcycle":  # HIGH: Micro motorcycle detection for distant plates
+            method_score = 8.0
+        elif method == "distant_motorcycle":  # HIGH: Distant motorcycle detection
+            method_score = 7.0
+        elif method.startswith("multiscale_"):  # HIGH: Multi-scale detection methods
+            method_score = 6.0
+        elif method == "motorcycle":  # HIGH: Standard motorcycle-specific detection
+            method_score = 5.0
+        elif method == "2line":  # HIGH: Two-line plate detection  
+            method_score = 4.5
+        
+        # OTHER METHODS
+        elif method == "bus":  # MEDIUM-HIGH: Bus-specific detection
             method_score = 3.0
-        elif method == "bright":  # Light text detection for buses
+        elif method == "bright":  # MEDIUM: Light text detection for buses
             method_score = 2.5
-        elif method in ["dark", "contrast"]:  # Good for regular license plates
+        elif method in ["dark", "contrast"]:  # MEDIUM: Good for regular license plates
             method_score = 2.0
-        elif method == "adaptive":  # Adaptive thresholding is good for varied lighting
+        elif method == "adaptive":  # MEDIUM-LOW: Adaptive thresholding
             method_score = 1.8
-        elif method == "edge":  # Edge detection picks up borders well
+        elif method == "edge":  # MEDIUM-LOW: Edge detection
             method_score = 1.6
         
         # Additional scoring bonus for license plate-like characteristics
@@ -1286,20 +1452,35 @@ def process_image_through_phases(img_np: np.ndarray) -> Tuple[Dict[str, np.ndarr
         center_x = x + w/2
         center_y = y + h/2
         
-        # Strong penalty for edge positions (likely false detections)
-        if (x <= 10 or y <= 10 or 
-            (x + w) >= (img_width - 10) or (y + h) >= (img_height - 10)):
-            characteristic_bonus = 0.01  # Extreme penalty for edge detections
+        # Smart position-based characteristic bonus (motorcycle-aware)
+        if (x <= 5 or y <= 5 or 
+            (x + w) >= (img_width - 5) or (y + h) >= (img_height - 5)):
+            characteristic_bonus = 0.01  # Extreme penalty for true edge detections
         
-        # Bonus for license plate typical positions
-        elif (img_height * 0.3 <= center_y <= img_height * 0.9 and  # Lower 60% of image
-              img_width * 0.1 <= center_x <= img_width * 0.9):       # Central 80% horizontally
-            characteristic_bonus = 1.5
+        # Enhanced bonus system for different plate types
+        elif is_small_plate:  # Different rules for small motorcycle plates
+            # Motorcycles can be anywhere in lower 2/3 of image
+            if (img_height * 0.2 <= center_y <= img_height * 0.95 and  # Lower 75% of image
+                img_width * 0.05 <= center_x <= img_width * 0.95):     # Almost entire width (motorcycles can be at sides)
+                characteristic_bonus = 2.0  # Higher bonus for small plates in good positions
+        else:  # Rules for larger car plates
+            # Cars typically in lower 60% and more centered
+            if (img_height * 0.3 <= center_y <= img_height * 0.9 and  # Lower 60% of image
+                img_width * 0.1 <= center_x <= img_width * 0.9):       # Central 80% horizontally
+                characteristic_bonus = 1.5
         
-        # Bonus for realistic license plate sizes in the image
+        # Enhanced size-based bonus for image coverage
         image_coverage = area / (img_width * img_height)
-        if 0.002 <= image_coverage <= 0.03:  # 0.2% to 3% of image area is ideal for plates
-            characteristic_bonus *= 1.3
+        if is_small_plate:
+            # Motorcycle plates: 0.01% to 1% of image area
+            if 0.0001 <= image_coverage <= 0.01:  
+                characteristic_bonus *= 1.8  # Higher bonus for small plate coverage
+            elif 0.01 <= image_coverage <= 0.02:  # Slightly larger motorcycles
+                characteristic_bonus *= 1.5
+        else:
+            # Car plates: 0.2% to 3% of image area  
+            if 0.002 <= image_coverage <= 0.03:
+                characteristic_bonus *= 1.3
         
         return area_score * edge_penalty * position_score * size_score * aspect_score * method_score * characteristic_bonus
     
