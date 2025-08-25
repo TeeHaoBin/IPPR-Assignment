@@ -1544,12 +1544,6 @@ def identify_state(plate_text: str) -> str:
     # Default to unknown
     return "Unknown"
 
-def classify_vehicle(image: np.ndarray) -> str:
-    """Classify vehicle type (placeholder implementation)"""
-    # This is a placeholder - you can implement actual vehicle classification here
-    # For now, just return "Car" as default
-    return "Car"
-
 def validate_uploaded_file(uploaded_file) -> bool:
     """Validate uploaded file"""
     if uploaded_file is None:
@@ -1740,7 +1734,6 @@ with tab1:
                         
                         # Identify state and vehicle type
                         state = identify_state(plate_text)
-                        vehicle_type = classify_vehicle(img_np)
                         
                         # Store results
                         result_data = {
@@ -1749,7 +1742,6 @@ with tab1:
                             "plate_candidates": plate_candidates,
                             "plate_text": plate_text,
                             "state": state,
-                            "vehicle_type": vehicle_type,
                             "original_image": img,
                         }
                         
@@ -1897,13 +1889,6 @@ with tab3:
                         <h4 style="margin: 0 0 10px 0; color: #2e8b57;">📍 State/Region</h4>
                         <p style="font-size: 18px; font-weight: bold; margin: 0; color: #333;">
                             {result['state']}
-                        </p>
-                    </div>
-                    
-                    <div style="background: linear-gradient(135deg, #fff0e6, #fffaf0); padding: 15px; border-radius: 10px; margin: 10px 0; border-left: 5px solid #ff8c00;">
-                        <h4 style="margin: 0 0 10px 0; color: #ff8c00;">🚗 Vehicle Classification</h4>
-                        <p style="font-size: 18px; font-weight: bold; margin: 0; color: #333;">
-                            {result['vehicle_type']}
                         </p>
                     </div>
                     """
