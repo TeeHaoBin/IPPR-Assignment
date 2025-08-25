@@ -1784,7 +1784,7 @@ with tab2:
             
             # Phase information
             phase_info = [
-                ("original", "📥 Phase 1: Image Acquisition", "Original input image"),
+                ("grayscale", "📥 Phase 1: Pre-Processing", "Gray Scale Image"),
                 ("enhanced", "✨ Phase 2: Image Enhancement", "Histogram equalization + gamma correction"),
                 ("restored", "🔧 Phase 3: Image Restoration", "Bilateral filtering for noise reduction"),
                 ("color_processed", "🌈 Phase 4: Color Processing", "HSV Value channel extraction"),
