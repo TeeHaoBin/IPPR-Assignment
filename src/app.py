@@ -82,10 +82,6 @@ def analyze_color_characteristics(roi_color):
         hsv = cv2.cvtColor(roi_color, cv2.COLOR_RGB2HSV)
         h, s, v = cv2.split(hsv)
         
-        # Malaysian license plates typically have:
-        # - White/light backgrounds with dark text
-        # - Black backgrounds with white/yellow text (taxis)
-        # - Blue backgrounds with white text (government)
         
         # Check for dominant light background (most common)
         light_pixels = np.sum(v > 180)  # Bright pixels
@@ -810,16 +806,7 @@ def detect_text_lines(roi_gray):
         return []
 
 def extract_license_plate_text_correct(ocr_model, image: np.ndarray) -> Optional[str]:
-    """
-    Enhanced OCR function for text extraction from license plates with 2-line support
-    
-    Args:
-        ocr_model: Loaded OCR model
-        image: Input image for text extraction
-        
-    Returns:
-        Extracted text or None if extraction failed
-    """
+
     if ocr_model is None:
         return None
         
