@@ -1,4 +1,4 @@
-# Malaysian License Plate Recognition System (IPPR)
+# Malaysian License Plate Recognition System (MLPRS)
 
 A comprehensive **Image Processing, Computer Vision & Pattern Recognition** system specifically designed for Malaysian license plate detection and recognition. This system implements a sophisticated 9-phase image processing pipeline using classical computer vision techniques combined with modern OCR technology.
 
